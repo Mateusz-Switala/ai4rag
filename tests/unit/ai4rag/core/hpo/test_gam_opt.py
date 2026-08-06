@@ -20,7 +20,7 @@ class TestGAMOptSettings:
         settings = GAMOptSettings(max_evals=20)
 
         assert settings.max_evals == 20
-        assert settings.n_random_nodes == 4
+        assert settings.n_random_nodes == 8
         assert settings.evals_per_trial == 1
         assert settings.random_state == 64
 

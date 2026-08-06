@@ -31,7 +31,7 @@ class GAMOptSettings(OptimizerSettings):
     ----------
     max_evals : int
         Maximum number of evaluations performed during optimization process.
-    n_random_nodes : int, default=4
+    n_random_nodes : int, default=8
         Number of random configurations to evaluate before starting GAM iterations.
         The initial sample is stratified: for every string-valued categorical
         parameter (e.g. ``search_mode``, ``chunking_method``, ``ranker_strategy``),
@@ -48,7 +48,7 @@ class GAMOptSettings(OptimizerSettings):
         (GAM training is deterministic).
     """
 
-    n_random_nodes: int = 4
+    n_random_nodes: int = 8
     evals_per_trial: int = 1
 
 
