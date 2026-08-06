@@ -33,13 +33,13 @@ class GAMOptSettings(OptimizerSettings):
         Maximum number of evaluations performed during optimization process.
     n_random_nodes : int, default=8
         Number of random configurations to evaluate before starting GAM iterations.
-        The initial sample is stratified: for every string-valued categorical
-        parameter (e.g. ``search_mode``, ``chunking_method``, ``ranker_strategy``),
-        at least one configuration for each unique value is guaranteed to appear
-        before the random fill, regardless of raw search space imbalance.
-        Integer/float parameters are not stratified.  Set this to at least the
-        number of unique values of the most varied string parameter to guarantee
-        full categorical coverage; a warning is emitted when the value is too small.
+        The initial sample is proportionally stratified: string-valued categorical
+        parameters (e.g. ``search_mode``, ``chunking_method``, ``ranker_strategy``)
+        are interleaved so that at every prefix of the evaluation sequence, each
+        value's share matches its share in the full search space.  Integer/float
+        parameters are not stratified.  Set this to at least the number of unique
+        values of the most varied string parameter to guarantee full categorical
+        coverage; a warning is emitted when the value is too small.
     evals_per_trial : int, default=1
         Number of configurations to evaluate per GAM iteration.
     random_state : int, default=64
@@ -198,12 +198,12 @@ class GAMOptimizer(BaseOptimizer):
         already-successful evaluations count toward the n_random_nodes target
         and already-evaluated combinations are excluded from candidates.
 
-        The selection is stratified: combinations that introduce at least one new
-        unique value for any categorical (string-valued) parameter are moved to the
-        front of the queue before the random fill. This guarantees that every
-        distinct categorical value (e.g. ``search_mode="vector"`` vs
-        ``search_mode="hybrid"``) is evaluated at least once before GAM training
-        begins, regardless of how skewed the raw search space is.
+        The selection is stratified: combinations are reordered so that any
+        prefix of the evaluation sequence has the same proportional distribution
+        of string-valued categorical parameters as the full search space.  A
+        minority value (e.g. ``search_mode="vector"`` in a space dominated by
+        ``"hybrid"``) receives evaluations proportional to its share, rather
+        than being crowded out by the majority.
 
         A warning is logged when ``n_random_nodes`` is smaller than the estimated
         minimum required to guarantee full categorical coverage.
@@ -296,19 +296,22 @@ class GAMOptimizer(BaseOptimizer):
         already_seen: dict[str, set[str]] | None = None,
     ) -> list[dict]:
         """
-        Re-order *already-shuffled* combinations so the first entries collectively
-        cover every unique value of each string-valued (semantic categorical)
-        parameter before falling back to the original shuffle order.
+        Re-order *already-shuffled* combinations so that any prefix of the result
+        has the same proportional distribution of string-valued categorical parameters
+        as the full combination list.
 
-        Only string-typed columns are stratified over. Integer/float parameters
-        (``chunk_size``, ``ranker_k``, etc.) are excluded because they tend to have
-        high cardinality; including them would consume all ``n_random_nodes`` slots
-        covering their many unique values and crowd out the minority string-param
-        values the stratification is meant to protect.
+        Each combination is assigned a priority of
+        ``max(rank_in_value_group / count_in_value_group)`` over all categorical
+        columns, where *rank_in_value_group* is the position of this combination
+        among all combinations sharing the same value for that column (in the
+        original shuffle order).  Sorting by this priority ascending interleaves
+        value groups proportionally (Bresenham fractional-index approach), so
+        the cumulative share of each categorical value after k selections mirrors
+        its share in the full list.
 
-        This prevents the initial random phase from being biased toward
-        over-represented parameter values (e.g. ``search_mode="hybrid"`` in a
-        search space where hybrid configurations outnumber vector ones 2:1).
+        Only string-typed columns are stratified; integer/float parameters
+        (``chunk_size``, ``ranker_k``, etc.) are excluded because their high
+        cardinality would distort the ordering.
 
         Parameters
         ----------
@@ -316,53 +319,51 @@ class GAMOptimizer(BaseOptimizer):
             Shuffled list of parameter combinations.
         already_seen : dict[str, set[str]], optional
             String-param values already covered by successful warm-start
-            observations.  These are treated as pre-seen so stratification does
-            not waste early slots on redundant coverage.
+            observations.  These values start with a rank offset of 1, so
+            unseen values receive a proportional boost at the front.
 
         Returns
         -------
         list[dict]
-            The same combinations with diversity-maximising entries moved to the
-            front; the relative order within each group (stratified / remainder)
-            is preserved from the input shuffle.
+            The same combinations in proportional-interleaving order; ties
+            preserve the original shuffle order (stable sort).
         """
         if not combinations:
             return combinations
 
-        # Stratify only string-typed parameters (search_mode, chunking_method,
-        # ranker_strategy, …). Integer/float params (chunk_size, ranker_k, …) are
-        # quantitative: stratifying them would consume initial slots covering their
-        # many unique values, leaving no room for minority string-param values.
         categorical_cols = [col for col, val in combinations[0].items() if isinstance(val, str)]
         if not categorical_cols:
             return combinations
 
-        all_values = {col: {c[col] for c in combinations} for col in categorical_cols}
-        # Intersect with all_values so warm-start values absent from the remaining
-        # combinations do not prevent the all_covered check from ever firing.
-        seen: dict[str, set[str]] = {
-            col: (set(already_seen.get(col, ())) & all_values[col]) if already_seen else set()
-            for col in categorical_cols
-        }
-
-        stratified: list[dict] = []
-        remainder: list[dict] = []
-
+        value_counts: dict[str, dict[str, int]] = {col: {} for col in categorical_cols}
         for combo in combinations:
-            all_covered = all(seen[col] == all_values[col] for col in categorical_cols)
-            if all_covered:
-                remainder.append(combo)
-                continue
+            for col in categorical_cols:
+                val = combo[col]
+                value_counts[col][val] = value_counts[col].get(val, 0) + 1
 
-            introduces_new = any(combo[col] not in seen[col] for col in categorical_cols)
-            if introduces_new:
-                stratified.append(combo)
-                for col in categorical_cols:
-                    seen[col].add(combo[col])
-            else:
-                remainder.append(combo)
+        # Warm-start-covered values begin at rank 1 so unseen values are
+        # prioritised proportionally ahead of already-covered ones.
+        value_rank: dict[str, dict[str, int]] = {}
+        for col in categorical_cols:
+            col_rank: dict[str, int] = {}
+            if already_seen:
+                for val in already_seen.get(col, ()):
+                    if val in value_counts[col]:
+                        col_rank[val] = 1
+            value_rank[col] = col_rank
 
-        return stratified + remainder
+        priorities: list[float] = []
+        for combo in combinations:
+            p = max(
+                value_rank[col].get(combo[col], 0) / value_counts[col][combo[col]]
+                for col in categorical_cols
+            )
+            for col in categorical_cols:
+                val = combo[col]
+                value_rank[col][val] = value_rank[col].get(val, 0) + 1
+            priorities.append(p)
+
+        return [combinations[i] for i in sorted(range(len(combinations)), key=lambda i: priorities[i])]
 
     # pylint: disable=too-many-locals
     def _run_iteration(self) -> None:
