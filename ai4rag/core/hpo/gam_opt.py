@@ -301,13 +301,14 @@ class GAMOptimizer(BaseOptimizer):
         as the full combination list.
 
         Each combination is assigned a priority of
-        ``max(rank_in_value_group / count_in_value_group)`` over all categorical
+        ``min(rank_in_value_group / count_in_value_group)`` over all categorical
         columns, where *rank_in_value_group* is the position of this combination
         among all combinations sharing the same value for that column (in the
-        original shuffle order).  Sorting by this priority ascending interleaves
-        value groups proportionally (Bresenham fractional-index approach), so
-        the cumulative share of each categorical value after k selections mirrors
-        its share in the full list.
+        original shuffle order).  Using ``min`` ensures that any combination
+        introducing a new value for *any* categorical column receives priority 0,
+        guaranteeing all distinct values appear before any second occurrence of any
+        value.  After full coverage is achieved, the fractional-index ordering
+        interleaves remaining combinations proportionally to their frequency.
 
         Only string-typed columns are stratified; integer/float parameters
         (``chunk_size``, ``ranker_k``, etc.) are excluded because their high
@@ -354,7 +355,7 @@ class GAMOptimizer(BaseOptimizer):
 
         priorities: list[float] = []
         for combo in combinations:
-            p = max(
+            p = min(
                 value_rank[col].get(combo[col], 0) / value_counts[col][combo[col]]
                 for col in categorical_cols
             )
