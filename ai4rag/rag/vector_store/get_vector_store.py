@@ -5,8 +5,9 @@
 from ..embedding.base_model import BaseEmbeddingModel
 from .base_vector_store import BaseVectorStore
 from .chroma import ChromaVectorStore
-from .config import BaseVectorStoreConfig, ChromaConfig, MilvusConfig, PGVectorConfig
+from .config import BaseVectorStoreConfig, ChromaConfig, MilvusConfig, Neo4jConfig, PGVectorConfig
 from .milvus import MilvusVectorStore
+from .neo4j import Neo4jGraphStore
 from .pgvector import PGVectorStore
 
 
@@ -74,6 +75,16 @@ def get_vector_store(
                 raise TypeError("PGVectorConfig is required when provider='pgvector'.")
 
             return PGVectorStore(
+                embedding_model=embedding_model,
+                config=config,
+                collection_name=collection_name,
+            )
+
+        case "neo4j":
+            if not isinstance(config, Neo4jConfig):
+                raise TypeError("Neo4jConfig is required when provider='neo4j'.")
+
+            return Neo4jGraphStore(
                 embedding_model=embedding_model,
                 config=config,
                 collection_name=collection_name,

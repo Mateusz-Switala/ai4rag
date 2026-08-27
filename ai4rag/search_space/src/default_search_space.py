@@ -31,8 +31,9 @@ def get_default_ai4rag_search_space_parameters(vector_store_type: str = "milvus"
     ----------
     vector_store_type : str, default="milvus"
         Type of vector store. Supported values: ``"milvus"``, ``"pgvector"``,
-        and ``"chroma"``. When ``"chroma"``, hybrid search parameters are
-        excluded since ChromaDB does not support hybrid search.
+        ``"chroma"``, and ``"neo4j"``. When ``"chroma"``, hybrid search
+        parameters are excluded since ChromaDB does not support hybrid search.
+        When ``"neo4j"``, ``"graph"`` is included as an additional search mode.
 
     Returns
     -------
@@ -59,6 +60,15 @@ def get_default_ai4rag_search_space_parameters(vector_store_type: str = "milvus"
     if vector_store_type == "chroma":
         default_search_space_parameters.append(
             Parameter(name=AI4RAGParamNames.SEARCH_MODE, values=("vector",)),
+        )
+    elif vector_store_type == "neo4j":
+        default_search_space_parameters.extend(
+            [
+                Parameter(name=AI4RAGParamNames.SEARCH_MODE, values=("vector", "graph")),
+                Parameter(name=AI4RAGParamNames.RANKER_STRATEGY, values=_default_ranker_strategies),
+                Parameter(name=AI4RAGParamNames.RANKER_K, values=_default_ranker_k),
+                Parameter(name=AI4RAGParamNames.RANKER_ALPHA, values=_default_ranker_alpha),
+            ]
         )
     else:
         default_search_space_parameters.extend(

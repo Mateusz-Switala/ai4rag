@@ -7,12 +7,14 @@ from ai4rag.rag.vector_store.chroma import ChromaVectorStore
 from ai4rag.rag.vector_store.config import (
     ChromaConfig,
     MilvusConfig,
+    Neo4jConfig,
     PGVectorConfig,
     get_vector_store_config,
     get_vector_store_env_vars,
 )
 from ai4rag.rag.vector_store.get_vector_store import get_vector_store
 from ai4rag.rag.vector_store.milvus import MilvusVectorStore
+from ai4rag.rag.vector_store.neo4j import Neo4jGraphStore
 from ai4rag.rag.vector_store.pgvector import PGVectorStore
 
 __all__ = [
@@ -21,6 +23,8 @@ __all__ = [
     "ChromaVectorStore",
     "MilvusConfig",
     "MilvusVectorStore",
+    "Neo4jConfig",
+    "Neo4jGraphStore",
     "PGVectorConfig",
     "PGVectorStore",
     "get_vector_store",
