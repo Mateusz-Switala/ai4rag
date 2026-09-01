@@ -35,7 +35,7 @@ _logger = logging.getLogger("rag-templates-optimization")
 _logger.addHandler(handler)
 
 DEFAULT_MAX_RAG_PATTERNS = 8
-MIN_MAX_RAG_PATTERNS_RANGE = (4, 20)
+MIN_MAX_RAG_PATTERNS_RANGE = (4, 72)
 
 # LLM-as-a-judge evaluator selection for the optimization run. The
 # reference-based ``UnitxtEvaluator`` always runs; this only controls the
