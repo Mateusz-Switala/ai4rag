@@ -2,6 +2,8 @@
 # Copyright IBM Corp. 2025-2026
 # SPDX-License-Identifier: Apache-2.0
 # -----------------------------------------------------------------------------
+from typing import Any
+
 from ..embedding.base_model import BaseEmbeddingModel
 from .base_vector_store import BaseVectorStore
 from .chroma import ChromaVectorStore
@@ -15,6 +17,7 @@ def get_vector_store(
     embedding_model: BaseEmbeddingModel,
     config: BaseVectorStoreConfig,
     collection_name: str | None = None,
+    foundation_model: Any = None,
 ) -> BaseVectorStore:
     """Get vector store of desired type with chosen settings.
 
@@ -34,6 +37,10 @@ def get_vector_store(
         Name of an existing collection to reuse. When omitted, a new name
         is generated following the ai4rag naming convention (see
         :func:`ai4rag.rag.vector_store.utils.generate_collection_name`).
+    foundation_model : Any, default=None
+        Optional foundation model passed to :class:`Neo4jGraphStore` for
+        entity extraction during :meth:`add_documents`.  Ignored for all
+        other backends.
 
     Returns
     -------
@@ -88,6 +95,7 @@ def get_vector_store(
                 embedding_model=embedding_model,
                 config=config,
                 collection_name=collection_name,
+                foundation_model=foundation_model,
             )
 
         case _:
