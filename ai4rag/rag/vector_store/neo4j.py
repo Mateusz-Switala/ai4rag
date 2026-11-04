@@ -12,6 +12,7 @@ from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
+from time import perf_counter
 from typing import Any
 
 import neo4j
@@ -187,6 +188,7 @@ class Neo4jGraphStore(BaseVectorStore):
 
     def _ensure_kg_schema(self, *, wait_until_online: bool = False) -> None:
         """Create this collection's vector index, optionally waiting for it to become queryable."""
+        started_at = perf_counter()
         index_name = _collection_vector_index_name(self._collection_name)
         with self._driver.session(database=self._config.database) as session:
             session.run(
@@ -204,7 +206,16 @@ class Neo4jGraphStore(BaseVectorStore):
                     index_name=index_name,
                     timeout_seconds=self._VECTOR_INDEX_WAIT_SECONDS,
                 ).consume()
+        logger.info(
+            "Neo4j vector index %s for collection=%s completed in %.2fs.",
+            "online wait" if wait_until_online else "creation request",
+            self._collection_name,
+            perf_counter() - started_at,
+        )
 
+    # Pylint counts loop and comprehension targets below as locals. They are
+    # intentionally kept together to make the write batching transaction-safe.
+    # pylint: disable-next=too-many-locals
     def add_documents(self, documents: list[AI4RAGChunk], **kwargs) -> None:
         """Embed, deduplicate, and upsert chunks into Neo4j.
 
@@ -239,7 +250,14 @@ class Neo4jGraphStore(BaseVectorStore):
         if not documents:
             return
 
+        started_at = perf_counter()
         embeddings = self.embedding_model.embed_documents([doc.text for doc in documents])
+        logger.info(
+            "Canonical embedding for %d chunks completed in %.2fs (collection=%s).",
+            len(documents),
+            perf_counter() - started_at,
+            self._collection_name,
+        )
         unique_pairs = list(iter_unique_chunks(documents, embeddings))
 
         doc_groups: dict[str, list[tuple[AI4RAGChunk, list[float]]]] = {}
@@ -254,6 +272,7 @@ class Neo4jGraphStore(BaseVectorStore):
         pending: list[tuple[str, list[tuple[AI4RAGChunk, list[float]]]]] = []
         pending_count = 0
 
+        started_at = perf_counter()
         for doc_id, sorted_pairs in doc_groups.items():
             pending.append((doc_id, sorted_pairs))
             pending_count += len(sorted_pairs)
@@ -264,6 +283,12 @@ class Neo4jGraphStore(BaseVectorStore):
 
         if pending:
             self._upsert_doc_groups(pending)
+        logger.info(
+            "Canonical graph write for %d chunks completed in %.2fs (collection=%s).",
+            len(unique_pairs),
+            perf_counter() - started_at,
+            self._collection_name,
+        )
 
         # Building HNSW from the completed chunk set is substantially faster
         # than maintaining it incrementally while each chunk is written.  Do
@@ -275,6 +300,7 @@ class Neo4jGraphStore(BaseVectorStore):
         if model is not None:
             self._run_kg_pipeline(
                 chunks=[chunk for chunk, _ in unique_pairs],
+                canonical_embeddings={chunk.text: embedding for chunk, embedding in unique_pairs},
                 model=model,
                 max_concurrent=self._get_kg_max_concurrent(kwargs),
                 on_error=kwargs.get("on_error", "IGNORE"),
@@ -289,10 +315,14 @@ class Neo4jGraphStore(BaseVectorStore):
             raise ValueError("kg_max_concurrent must be a positive integer.")
         return value
 
+    # The adapters, writer, and pipeline are deliberately retained for phase
+    # metrics after asynchronous extraction completes.
+    # pylint: disable-next=too-many-locals
     def _run_kg_pipeline(
         self,
         chunks: list[AI4RAGChunk],
         model: Any,
+        canonical_embeddings: Mapping[str, list[float]] | None = None,
         max_concurrent: int = _DEFAULT_KG_EXTRACTION_CONCURRENCY,
         on_error: str = "IGNORE",
         perform_entity_resolution: bool = True,
@@ -320,10 +350,15 @@ class Neo4jGraphStore(BaseVectorStore):
         )
 
         kg_writer = _CanonicalKGWriter(self._driver, self._config.database, self._collection_name)
+        # Ensure the shared temporary-node index before task fan-out. Each
+        # pipeline invocation calls this hook, but subsequent calls are no-ops.
+        kg_writer.ensure_setup()
+        llm = _LLMAdapter(model, max_completion_tokens=self._kg_extraction_config["max_completion_tokens"])
+        embedder = _EmbedderAdapter(self.embedding_model, canonical_embeddings)
         pipeline = SimpleKGPipeline(
-            llm=_LLMAdapter(model, max_completion_tokens=self._kg_extraction_config["max_completion_tokens"]),
+            llm=llm,
             driver=self._driver,
-            embedder=_EmbedderAdapter(self.embedding_model),
+            embedder=embedder,
             from_pdf=False,
             text_splitter=_PreChunkedTextSplitter(),
             on_error=on_error,
@@ -378,6 +413,20 @@ class Neo4jGraphStore(BaseVectorStore):
 
         if perform_entity_resolution:
             self._resolve_kg_entities()
+
+        llm_calls, llm_elapsed_seconds = llm.metrics
+        embedding_calls, embedding_cache_hits, embedding_elapsed_seconds = embedder.metrics
+        logger.info(
+            "KG phases for collection=%s: LLM=%d calls/%.2fs, embeddings=%d model calls/"
+            "%d cache hits/%.2fs, graph writes=%.2fs.",
+            self._collection_name,
+            llm_calls,
+            llm_elapsed_seconds,
+            embedding_calls,
+            embedding_cache_hits,
+            embedding_elapsed_seconds,
+            kg_writer.write_elapsed_seconds,
+        )
 
         logger.info(
             "Finished entity extraction for %d chunks (collection=%s).",

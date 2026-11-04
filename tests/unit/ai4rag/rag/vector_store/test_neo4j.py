@@ -23,6 +23,7 @@ from ai4rag.rag.vector_store.neo4j_utils import (
     _build_graph_retrieval_query,
     _CanonicalKGWriter,
     _CollectionKGWriter,
+    _EmbedderAdapter,
     _kg_pipeline_extraction_options,
     _LLMAdapter,
     _PreChunkedTextSplitter,
@@ -81,6 +82,16 @@ def test_llm_adapter_can_override_the_completion_limit_for_entity_extraction():
     _LLMAdapter(model, max_completion_tokens=1024).invoke("Extract entities.")
 
     model.chat.assert_called_once_with([{"role": "user", "content": "Extract entities."}], max_completion_tokens=1024)
+
+
+def test_kg_embedder_reuses_canonical_embedding(mock_embedding):
+    adapter = _EmbedderAdapter(mock_embedding, {"canonical chunk": [0.9, 0.8]})
+
+    assert adapter.embed_query("canonical chunk") == [0.9, 0.8]
+    assert adapter.embed_query("entity name") == [0.1] * 128
+    model_calls, cache_hits, elapsed_seconds = adapter.metrics
+    assert (model_calls, cache_hits) == (1, 1)
+    assert elapsed_seconds >= 0
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +798,8 @@ def test_collection_writer_tags_only_upserted_relationships():
     query = driver.execute_query.call_args.args[0]
     parameters = driver.execute_query.call_args.kwargs["parameters_"]
     assert "CALL apoc.merge.relationship(start, row.type" in query
+    assert "MATCH (start:__KGBuilder__ {__tmp_internal_id: row.start_node_id})," not in query
+    assert "WITH start, row MATCH (end:__KGBuilder__" in query
     assert "SET rel.ai4rag_kg_collections = CASE" in query
     assert "WHEN $col IN COALESCE(rel.ai4rag_kg_collections, [])" in query
     assert parameters["col"] == "ai4rag_col"
@@ -808,6 +821,20 @@ def test_collection_writer_setup_and_cleanup_use_configured_database():
     cleanup_query = driver.session.return_value.__enter__.return_value.run.call_args.args[0]
     assert "MATCH (n:__KGBuilder__)" in cleanup_query
     assert "IN TRANSACTIONS" in cleanup_query
+
+
+def test_collection_writer_creates_temporary_index_once():
+    driver = MagicMock()
+    with patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)):
+        writer = _CollectionKGWriter(driver, "tenant_graph", "ai4rag_col")
+
+    writer.ensure_setup()
+    writer.ensure_setup()
+
+    setup_calls = [
+        call for call in driver.execute_query.call_args_list if "CREATE INDEX __entity__tmp_internal_id" in call.args[0]
+    ]
+    assert len(setup_calls) == 1
 
 
 @pytest.mark.parametrize("serialized", [False, True])
