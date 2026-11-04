@@ -156,6 +156,7 @@ class Neo4jGraphStore(BaseVectorStore):
 
     _BATCH_SIZE = 512
     _DEFAULT_KG_EXTRACTION_CONCURRENCY = 2
+    _VECTOR_INDEX_WAIT_SECONDS = 600
 
     def __init__(
         self,
@@ -183,10 +184,9 @@ class Neo4jGraphStore(BaseVectorStore):
         driver_uri = _normalize_custom_ca_uri(config.uri) if config.ca_cert else config.uri
         self._driver = neo4j.GraphDatabase.driver(driver_uri, **driver_kwargs)
         self._driver.verify_connectivity()
-        self._ensure_kg_schema()
 
-    def _ensure_kg_schema(self) -> None:
-        """Create this collection's chunk vector index."""
+    def _ensure_kg_schema(self, *, wait_until_online: bool = False) -> None:
+        """Create this collection's vector index, optionally waiting for it to become queryable."""
         index_name = _collection_vector_index_name(self._collection_name)
         with self._driver.session(database=self._config.database) as session:
             session.run(
@@ -198,6 +198,12 @@ class Neo4jGraphStore(BaseVectorStore):
                 f"OPTIONS {{indexConfig: {{`vector.dimensions`: $dim, `vector.similarity_function`: 'cosine'}}}}",
                 dim=self._embedding_dimension,
             )
+            if wait_until_online:
+                session.run(
+                    "CALL db.awaitIndex($index_name, $timeout_seconds)",
+                    index_name=index_name,
+                    timeout_seconds=self._VECTOR_INDEX_WAIT_SECONDS,
+                ).consume()
 
     def add_documents(self, documents: list[AI4RAGChunk], **kwargs) -> None:
         """Embed, deduplicate, and upsert chunks into Neo4j.
@@ -227,11 +233,11 @@ class Neo4jGraphStore(BaseVectorStore):
             - ``model`` — foundation model used for entity extraction. When
               omitted and no model was supplied at construction, graph search
               returns ANN seed chunks without entity-based context expansion.
+            - ``kg_max_concurrent`` (int) — maximum concurrent KG extraction
+              requests when a foundation model is present (default 2).
         """
         if not documents:
             return
-
-        self._ensure_kg_schema()
 
         embeddings = self.embedding_model.embed_documents([doc.text for doc in documents])
         unique_pairs = list(iter_unique_chunks(documents, embeddings))
@@ -259,14 +265,29 @@ class Neo4jGraphStore(BaseVectorStore):
         if pending:
             self._upsert_doc_groups(pending)
 
+        # Building HNSW from the completed chunk set is substantially faster
+        # than maintaining it incrementally while each chunk is written.  Do
+        # not wait here: KG extraction can proceed while Neo4j populates it;
+        # search waits for ONLINE before issuing a vector query.
+        self._ensure_kg_schema()
+
         model = kwargs.get("model", self._foundation_model)
         if model is not None:
             self._run_kg_pipeline(
                 chunks=[chunk for chunk, _ in unique_pairs],
                 model=model,
+                max_concurrent=self._get_kg_max_concurrent(kwargs),
                 on_error=kwargs.get("on_error", "IGNORE"),
                 perform_entity_resolution=kwargs.get("perform_entity_resolution", True),
             )
+
+    @classmethod
+    def _get_kg_max_concurrent(cls, kwargs: Mapping[str, Any]) -> int:
+        """Read and validate the caller's concurrent KG extraction request limit."""
+        value = kwargs.get("kg_max_concurrent", cls._DEFAULT_KG_EXTRACTION_CONCURRENCY)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("kg_max_concurrent must be a positive integer.")
+        return value
 
     def _run_kg_pipeline(
         self,
@@ -396,52 +417,51 @@ class Neo4jGraphStore(BaseVectorStore):
         doc_groups: list[tuple[str, list[tuple[AI4RAGChunk, list[float]]]]],
         collection_name: str,
     ) -> None:
+        document_rows: list[dict[str, str]] = []
+        chunk_rows: list[dict[str, Any]] = []
+        next_chunk_rows: list[dict[str, str]] = []
         for doc_id, sorted_pairs in doc_groups:
             source = sorted_pairs[0][0].metadata.get("source", "")
-            tx.run(
-                f"MERGE (d:{collection_name}:{_SCHEMA.DOCUMENT_LABEL} {{{_SCHEMA.ID}: $doc_id}}) "
-                f"SET d.{_SCHEMA.SOURCE} = $source, d.{_SCHEMA.METADATA} = $doc_metadata",
-                doc_id=doc_id,
-                source=source,
-                doc_metadata=json.dumps({"source": source}),
+            document_rows.append({"id": doc_id, "source": source, "metadata": json.dumps({"source": source})})
+            for chunk, embedding in sorted_pairs:
+                clean_metadata = {**chunk.metadata, "source": chunk.metadata.get("source") or doc_id}
+                chunk_rows.append(
+                    {
+                        "id": chunk.chunk_id,
+                        "text": chunk.text,
+                        "embedding": embedding,
+                        "document_id": doc_id,
+                        "sequence_number": chunk.metadata.get("sequence_number", 0),
+                        "metadata": json.dumps(clean_metadata),
+                        "collection": collection_name,
+                    }
+                )
+            next_chunk_rows.extend(
+                {"id_a": sorted_pairs[index][0].chunk_id, "id_b": sorted_pairs[index + 1][0].chunk_id}
+                for index in range(len(sorted_pairs) - 1)
             )
 
-            for chunk, embedding in sorted_pairs:
-                clean_metadata = {
-                    **chunk.metadata,
-                    "source": chunk.metadata.get("source") or doc_id,
-                }
-                tx.run(
-                    f"MERGE (c:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: $id}}) "
-                    f"SET c.{_SCHEMA.TEXT} = $text, c.{_SCHEMA.EMBEDDING} = $embedding, "
-                    f"c.{_SCHEMA.DOCUMENT_ID} = $document_id, c.{_SCHEMA.SEQUENCE_NUMBER} = $sequence_number, "
-                    f"c.{_SCHEMA.METADATA} = $metadata, c.{_SCHEMA.COLLECTION} = $collection",
-                    id=chunk.chunk_id,
-                    text=chunk.text,
-                    embedding=embedding,
-                    document_id=doc_id,
-                    sequence_number=chunk.metadata.get("sequence_number", 0),
-                    metadata=json.dumps(clean_metadata),
-                    collection=collection_name,
-                )
-                tx.run(
-                    f"MATCH (d:{collection_name}:{_SCHEMA.DOCUMENT_LABEL} {{{_SCHEMA.ID}: $doc_id}}) "
-                    f"MATCH (c:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: $chunk_id}}) "
-                    f"MERGE (d)-[:{_SCHEMA.CONTAINS_RELATIONSHIP}]->(c)",
-                    doc_id=doc_id,
-                    chunk_id=chunk.chunk_id,
-                )
-
-            for i in range(len(sorted_pairs) - 1):
-                chunk_a = sorted_pairs[i][0]
-                chunk_b = sorted_pairs[i + 1][0]
-                tx.run(
-                    f"MATCH (a:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: $id_a}}) "
-                    f"MATCH (b:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: $id_b}}) "
-                    f"MERGE (a)-[:{_SCHEMA.NEXT_CHUNK_RELATIONSHIP}]->(b)",
-                    id_a=chunk_a.chunk_id,
-                    id_b=chunk_b.chunk_id,
-                )
+        tx.run(
+            f"UNWIND $rows AS row MERGE (d:{collection_name}:{_SCHEMA.DOCUMENT_LABEL} {{{_SCHEMA.ID}: row.id}}) "
+            f"SET d.{_SCHEMA.SOURCE} = row.source, d.{_SCHEMA.METADATA} = row.metadata",
+            rows=document_rows,
+        ).consume()
+        tx.run(
+            f"UNWIND $rows AS row MERGE (c:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: row.id}}) "
+            f"SET c.{_SCHEMA.TEXT} = row.text, c.{_SCHEMA.EMBEDDING} = row.embedding, "
+            f"c.{_SCHEMA.DOCUMENT_ID} = row.document_id, c.{_SCHEMA.SEQUENCE_NUMBER} = row.sequence_number, "
+            f"c.{_SCHEMA.METADATA} = row.metadata, c.{_SCHEMA.COLLECTION} = row.collection "
+            f"WITH c, row MATCH (d:{collection_name}:{_SCHEMA.DOCUMENT_LABEL} {{{_SCHEMA.ID}: row.document_id}}) "
+            f"MERGE (d)-[:{_SCHEMA.CONTAINS_RELATIONSHIP}]->(c)",
+            rows=chunk_rows,
+        ).consume()
+        if next_chunk_rows:
+            tx.run(
+                f"UNWIND $rows AS row MATCH (a:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: row.id_a}}) "
+                f"MATCH (b:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: row.id_b}}) "
+                f"MERGE (a)-[:{_SCHEMA.NEXT_CHUNK_RELATIONSHIP}]->(b)",
+                rows=next_chunk_rows,
+            ).consume()
 
     def search(
         self,
@@ -486,6 +506,7 @@ class Neo4jGraphStore(BaseVectorStore):
             store_class=type(self),
             **kwargs,
         )
+        self._ensure_kg_schema(wait_until_online=True)
 
         return self._search_graph(query, k, include_scores, **kwargs)
 

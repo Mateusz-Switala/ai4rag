@@ -288,17 +288,15 @@ def test_graph_route_fusion_deduplicates_evidence_and_preserves_routes():
 
 @patch("ai4rag.rag.vector_store.neo4j.neo4j.GraphDatabase.driver")
 class TestNeo4jGraphStoreInit:
-    def test_creates_collection_specific_graph_vector_index(self, mock_driver_cls, mock_embedding, neo4j_config):
+    def test_defers_collection_vector_index_until_chunks_are_written(
+        self, mock_driver_cls, mock_embedding, neo4j_config
+    ):
         Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
 
         session = mock_driver_cls.return_value.session.return_value.__enter__.return_value
         cypher_calls = [str(c) for c in session.run.call_args_list]
         joined = " ".join(cypher_calls)
-        assert "VECTOR INDEX" in joined
-        assert "ai4rag_col__embedding" in joined
-        assert "(n:`ai4rag_col`)" in joined
-        assert "(n:`ai4rag_col`:Chunk)" not in joined
-        assert "FULLTEXT INDEX" not in joined
+        assert "VECTOR INDEX" not in joined
 
     def test_verifies_connectivity(self, mock_driver_cls, mock_embedding, neo4j_config):
         Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
@@ -381,6 +379,8 @@ class TestAddDocuments:
 
         store.add_documents(chunks)
         session.execute_write.assert_called()
+        index_query = session.run.call_args.args[0]
+        assert "CREATE VECTOR INDEX `ai4rag_col__embedding`" in index_query
 
     def test_next_chunk_links_are_created(self, mock_driver_cls, mock_embedding, neo4j_config):
         """Consecutive chunks within one document must be linked with NEXT_CHUNK."""
@@ -394,6 +394,7 @@ class TestAddDocuments:
         store.add_documents(chunks)
 
         all_cypher = " ".join(str(c) for c in tx.run.call_args_list)
+        assert "UNWIND $rows AS row" in all_cypher
         assert "NEXT_CHUNK" in all_cypher
 
     def test_deduplicates_chunks(self, mock_driver_cls, mock_embedding, neo4j_config):
@@ -409,6 +410,29 @@ class TestAddDocuments:
         # Only one MERGE for the Chunk node (after dedup)
         merge_chunk_calls = [c for c in tx.run.call_args_list if "Chunk" in str(c) and "MERGE (c:" in str(c)]
         assert len(merge_chunk_calls) == 1
+
+    def test_upserts_each_write_batch_with_set_based_cypher(self, mock_driver_cls, mock_embedding, neo4j_config):
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        chunks = self._make_chunks(3)
+        tx = MagicMock()
+        session = mock_driver_cls.return_value.session.return_value.__enter__.return_value
+        session.execute_write.side_effect = lambda fn, *args, **kwargs: fn(tx, *args, **kwargs)
+
+        store.add_documents(chunks)
+
+        assert tx.run.call_count == 3
+        assert all("UNWIND $rows AS row" in call.args[0] for call in tx.run.call_args_list)
+        assert len(tx.run.call_args_list[1].kwargs["rows"]) == 3
+        assert len(tx.run.call_args_list[2].kwargs["rows"]) == 2
+
+    def test_forwards_kg_concurrency_override(self, mock_driver_cls, mock_embedding, neo4j_config):
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        chunks = self._make_chunks(1)
+
+        with patch.object(store, "_run_kg_pipeline") as run_pipeline:
+            store.add_documents(chunks, model=MagicMock(), kg_max_concurrent=4)
+
+        assert run_pipeline.call_args.kwargs["max_concurrent"] == 4
 
     def test_pipeline_reuses_canonical_chunk_id(self, mock_driver_cls, mock_embedding, neo4j_config):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
