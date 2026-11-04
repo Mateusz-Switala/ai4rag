@@ -54,11 +54,11 @@ For Neo4j, the experiment's collection-reuse key includes chunking settings, emb
 The foundation-model and KG settings are part of the key because they change the extracted graph even when the chunk embeddings are identical.
 
 If no exact match exists, ai4rag creates a namespaced `ai4rag_*` collection.
-`Neo4jGraphStore` verifies connectivity and creates one collection-scoped cosine vector index with `IF NOT EXISTS`:
+`Neo4jGraphStore` verifies connectivity. After canonical chunks are written, it creates one collection-scoped cosine vector index with `IF NOT EXISTS`:
 
 - `{collection}__embedding` for chunk embeddings.
 
-The index targets the collection label.
+The index targets the collection label. Creating it after the bulk write lets Neo4j build the HNSW structure from the completed chunk set instead of maintaining it incrementally for every inserted chunk. ai4rag waits for the index to become online before the first search.
 That label isolates ANN seed retrieval; graph expansion also filters by the `collection` property.
 In the `add_documents()` workflow, both persistent `Document` nodes and canonical `Chunk` nodes receive the collection label; only chunks enter this vector index.
 
@@ -103,6 +103,7 @@ text and chunk index. During extraction, ai4rag suppresses GraphRAG's verbose lo
 that include document text, retains warnings/errors, and logs extraction start and
 completion with chunk counts.
 The pipeline uses `on_error="IGNORE"` and processes up to two chunks concurrently by default to reduce pressure on the foundation-model endpoint. Extraction start logs include the concurrency limit.
+For direct `Neo4jGraphStore.add_documents()` calls, pass `kg_max_concurrent` to raise that bounded request concurrency when the foundation-model endpoint has sufficient capacity. Each request still carries one canonical chunk so ai4rag can retain its exact chunk-to-entity provenance.
 ai4rag disables GraphRAG's database-wide resolver and optionally resolves entities for this collection after all chunk extraction finishes (enabled by default).
 Each chunk is therefore one KG extraction input; an upstream chunk that is too large for the foundation model can exceed its context limit.
 
