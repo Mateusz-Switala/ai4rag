@@ -8,6 +8,8 @@ import asyncio
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from threading import Lock
+from time import perf_counter
 from typing import Any, Iterator
 
 import neo4j
@@ -18,7 +20,7 @@ from neo4j_graphrag.embeddings.base import Embedder as _NeoEmbedder
 from neo4j_graphrag.generation.prompts import ERExtractionTemplate
 from neo4j_graphrag.llm.base import LLMInterface as _NeoLLMInterface
 from neo4j_graphrag.llm.types import LLMResponse
-from neo4j_graphrag.neo4j_queries import db_cleaning_query, upsert_relationship_query
+from neo4j_graphrag.neo4j_queries import db_cleaning_query
 
 from ai4rag.rag.embedding.base_model import BaseEmbeddingModel
 from ai4rag.rag.foundation_models.base_model import BaseFoundationModel, MessageTyped
@@ -134,12 +136,34 @@ def _kg_pipeline_extraction_options(config: dict[str, Any]) -> dict[str, Any]:
 class _EmbedderAdapter(_NeoEmbedder):  # type: ignore[misc]
     """Wraps :class:`BaseEmbeddingModel` to satisfy ``neo4j_graphrag``'s embedder interface."""
 
-    def __init__(self, model: BaseEmbeddingModel) -> None:
+    def __init__(self, model: BaseEmbeddingModel, cached_embeddings: Mapping[str, list[float]] | None = None) -> None:
         super().__init__()
         self._model = model
+        self._cached_embeddings = cached_embeddings or {}
+        self._model_calls = 0
+        self._cache_hits = 0
+        self._elapsed_seconds = 0.0
+        self._metrics_lock = Lock()
 
     def embed_query(self, text: str) -> list[float]:
-        return self._model.embed_query(text)
+        cached = self._cached_embeddings.get(text)
+        if cached is not None:
+            with self._metrics_lock:
+                self._cache_hits += 1
+            return cached
+
+        started_at = perf_counter()
+        result = self._model.embed_query(text)
+        with self._metrics_lock:
+            self._model_calls += 1
+            self._elapsed_seconds += perf_counter() - started_at
+        return result
+
+    @property
+    def metrics(self) -> tuple[int, int, float]:
+        """Return model calls, cache hits, and cumulative model-call duration."""
+        with self._metrics_lock:
+            return self._model_calls, self._cache_hits, self._elapsed_seconds
 
 
 # GraphRAG's tool-call defaults intentionally raise NotImplementedError.
@@ -159,6 +183,9 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         super().__init__(model_name=model.model_id)
         self._model = model
         self._max_completion_tokens = max_completion_tokens
+        self._calls = 0
+        self._elapsed_seconds = 0.0
+        self._metrics_lock = Lock()
 
     def invoke(
         self,
@@ -173,9 +200,19 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         kwargs = (
             {"max_completion_tokens": self._max_completion_tokens} if self._max_completion_tokens is not None else {}
         )
+        started_at = perf_counter()
         response = self._model.chat(messages, **kwargs)[0]
+        with self._metrics_lock:
+            self._calls += 1
+            self._elapsed_seconds += perf_counter() - started_at
         content = (response["content"] if isinstance(response, Mapping) else response.message.content) or ""
         return LLMResponse(content=content)
+
+    @property
+    def metrics(self) -> tuple[int, float]:
+        """Return model calls and their cumulative duration."""
+        with self._metrics_lock:
+            return self._calls, self._elapsed_seconds
 
     async def ainvoke(
         self,
@@ -193,12 +230,27 @@ class _CollectionKGWriter(Neo4jWriter):
     def __init__(self, driver: neo4j.Driver, database: str, collection_name: str) -> None:
         super().__init__(driver=driver, neo4j_database=database)
         self._collection_name = collection_name
+        self._setup_complete = False
+        self._setup_lock = Lock()
+        self._write_elapsed_seconds = 0.0
+        self._write_lock = Lock()
 
     def _db_setup(self) -> None:
-        self.driver.execute_query(
-            "CREATE INDEX __entity__tmp_internal_id IF NOT EXISTS FOR (n:__KGBuilder__) ON (n.__tmp_internal_id)",
-            database_=self.neo4j_database,
-        )
+        # SimpleKGPipeline invokes its writer once per canonical chunk. The
+        # temporary-node index is database-wide, so creating it more than once
+        # produces needless schema calls and noisy notifications.
+        with self._setup_lock:
+            if self._setup_complete:
+                return
+            self.driver.execute_query(
+                "CREATE INDEX __entity__tmp_internal_id IF NOT EXISTS FOR (n:__KGBuilder__) ON (n.__tmp_internal_id)",
+                database_=self.neo4j_database,
+            )
+            self._setup_complete = True
+
+    def ensure_setup(self) -> None:
+        """Create the shared temporary-node index before concurrent writes begin."""
+        self._db_setup()
 
     def _db_cleaning(self) -> None:
         query = db_cleaning_query(
@@ -213,19 +265,41 @@ class _CollectionKGWriter(Neo4jWriter):
         graph: Neo4jGraph,
         lexical_graph_config: LexicalGraphConfig = LexicalGraphConfig(),
     ) -> KGWriterModel:
-        return await super().run(graph, lexical_graph_config)
+        started_at = perf_counter()
+        try:
+            return await super().run(graph, lexical_graph_config)
+        finally:
+            with self._write_lock:
+                self._write_elapsed_seconds += perf_counter() - started_at
+
+    @property
+    def write_elapsed_seconds(self) -> float:
+        """Return cumulative time spent writing KG graphs."""
+        with self._write_lock:
+            return self._write_elapsed_seconds
 
     def _upsert_relationships(self, rels: list[Neo4jRelationship]) -> None:
-        query = upsert_relationship_query(support_variable_scope_clause=self.is_version_5_23_or_above)
-        if query.count("RETURN elementId(rel)") != 1:
-            raise RuntimeError("Neo4j GraphRAG relationship writer query changed; cannot record collection ownership.")
-        query = query.replace(
-            "RETURN elementId(rel)",
+        # Match each endpoint in a separate clause.  The upstream query uses
+        # two disconnected patterns in one MATCH, which emits a Cartesian
+        # product warning even though both endpoints are keyed by one row.
+        # Keeping `row` between clauses preserves its one-to-one association.
+        query = (
+            "UNWIND $rows AS row "
+            "MATCH (start:__KGBuilder__ {__tmp_internal_id: row.start_node_id}) "
+            "WITH start, row "
+            "MATCH (end:__KGBuilder__ {__tmp_internal_id: row.end_node_id}) "
+            "WITH start, end, row "
+            "CALL apoc.merge.relationship(start, row.type, {}, row.properties, end, row.properties) YIELD rel "
+            "WITH rel, row "
+            "CALL { WITH rel, row "
+            "WITH rel, row WHERE row.embedding_properties IS NOT NULL "
+            "UNWIND keys(row.embedding_properties) AS emb "
+            "CALL db.create.setRelationshipVectorProperty(rel, emb, row.embedding_properties[emb]) } "
             "SET rel.ai4rag_kg_collections = CASE "
             "WHEN $col IN COALESCE(rel.ai4rag_kg_collections, []) "
             "THEN rel.ai4rag_kg_collections "
             "ELSE COALESCE(rel.ai4rag_kg_collections, []) + $col END "
-            "RETURN elementId(rel)",
+            "RETURN elementId(rel)"
         )
         self.driver.execute_query(
             query,
