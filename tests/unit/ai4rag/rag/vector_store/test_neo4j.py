@@ -106,8 +106,8 @@ def test_llm_adapter_can_override_the_completion_limit_for_entity_extraction():
     model.chat.assert_called_once_with([{"role": "user", "content": "Extract entities."}], max_completion_tokens=1024)
 
 
-def test_llm_adapter_can_require_a_json_schema_response():
-    """KG extraction can request server-enforced structured output."""
+def test_llm_adapter_requests_a_json_object_response():
+    """KG extraction requests the MaaS-compatible JSON-object response mode."""
     model = MagicMock(model_id="test-model")
     model.chat.return_value = [{"role": "assistant", "content": '{"chunks": []}'}]
 
@@ -524,16 +524,20 @@ class TestAddDocuments:
             {"chunk_id": chunk.chunk_id, "text": text}
         ]
 
-    def test_kg_response_schema_bounds_graph_size_and_properties(self, _mock_driver_cls):
-        """The enforced schema keeps batch responses below the output budget."""
-        chunk_schema = KG_BATCH_RESPONSE_FORMAT["json_schema"]["schema"]["properties"]["chunks"]["items"]
+    def test_kg_response_uses_maas_compatible_json_object_mode(self, _mock_driver_cls):
+        assert KG_BATCH_RESPONSE_FORMAT == {"type": "json_object"}
 
-        assert chunk_schema["properties"]["nodes"]["maxItems"] == KG_MAX_ENTITIES_PER_CHUNK
-        assert chunk_schema["properties"]["relationships"]["maxItems"] == KG_MAX_RELATIONSHIPS_PER_CHUNK
-        node_properties = chunk_schema["properties"]["nodes"]["items"]["properties"]["properties"]
-        relationship_properties = chunk_schema["properties"]["relationships"]["items"]["properties"]["properties"]
-        assert node_properties["properties"] == {"name": {"type": "string"}}
-        assert relationship_properties["additionalProperties"] is False
+    def test_free_mode_prompt_honors_configured_graph_limits(self, mock_driver_cls, mock_embedding, neo4j_config):
+        store = Neo4jGraphStore(
+            mock_embedding,
+            neo4j_config,
+            collection_name="ai4rag_col",
+            kg_extraction_config={"mode": "free", "max_entities_per_chunk": 9, "max_relationships_per_chunk": 11},
+        )
+
+        prompt = store._build_kg_batch_prompt(self._make_chunks(1))
+
+        assert "at most 9 entities and 11 relationships" in prompt
 
     def test_kg_pipeline_does_not_log_chunk_text(self, mock_driver_cls, mock_embedding, neo4j_config, caplog):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
@@ -565,7 +569,7 @@ class TestAddDocuments:
             store._run_kg_pipeline(chunks, MagicMock(), perform_entity_resolution=False)
 
         assert (
-            "Starting entity extraction for 2 chunks in 1 batches (batch_size=2, max_concurrent=1, collection=ai4rag_col)."
+            "Starting entity extraction for 2 chunks in 1 batches (batch_size=2, max_concurrent=2, collection=ai4rag_col)."
             in caplog.messages
         )
         assert "Finished entity extraction for 2 chunks (collection=ai4rag_col)." in caplog.messages
@@ -621,13 +625,13 @@ class TestAddDocuments:
         ):
             store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
 
-        assert completion_limits == [1024, 1024, 1024, 2048, 2048]
+        assert completion_limits == [1024, 1024, 1024, 1024, 1024]
         assert sleep.await_args_list == [call(1), call(2)]
 
     def test_kg_pipeline_retries_then_splits_an_improper_batch_response(
         self, mock_driver_cls, mock_embedding, neo4j_config
     ):
-        """Malformed output retries once before a larger-budget singleton fallback."""
+        """Malformed output retries once before bounded singleton fallback."""
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
         completion_limits: list[int] = []
 
@@ -647,8 +651,29 @@ class TestAddDocuments:
         ):
             store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
 
-        assert completion_limits == [1024, 1024, 2048, 2048]
+        assert completion_limits == [1024, 1024, 1024, 1024]
         sleep.assert_awaited_once_with(1)
+
+    def test_kg_pipeline_retries_only_chunks_omitted_from_a_valid_batch(
+        self, mock_driver_cls, mock_embedding, neo4j_config
+    ):
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        request_sizes: list[int] = []
+
+        async def run_pipeline(_, prompt, _completion_limit):
+            payload = json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1])
+            request_sizes.append(len(payload))
+            returned = payload[:1]
+            return SimpleNamespace(
+                content=json.dumps(
+                    {"chunks": [{"chunk_id": item["chunk_id"], "nodes": [], "relationships": []} for item in returned]}
+                )
+            )
+
+        with patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline):
+            store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
+
+        assert request_sizes == [2, 1]
 
     def test_kg_pipeline_ignores_a_failed_single_chunk_by_default(
         self, mock_driver_cls, mock_embedding, neo4j_config, caplog

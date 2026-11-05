@@ -67,13 +67,14 @@ def _make_result(
     )
 
 
-def _build_experiment(evaluators=None, optimization_metric=Metrics.FAITHFULNESS, metrics=None):
+def _build_experiment(evaluators=None, optimization_metric=Metrics.FAITHFULNESS, metrics=None, **extra_kwargs):
     """Construct an AI4RAGExperiment with all heavy deps mocked out."""
     kwargs = {}
     if evaluators is not None:
         kwargs["evaluators"] = evaluators
     if metrics is not None:
         kwargs["metrics"] = metrics
+    kwargs.update(extra_kwargs)
     return AI4RAGExperiment(
         documents=[],
         benchmark_data=_BENCHMARK_DF,
@@ -114,6 +115,15 @@ class TestEvaluatorType:
 
 
 class TestRAGTemplateSelection:
+    def test_kg_concurrency_is_configurable_for_graph_indexing(self):
+        experiment = _build_experiment(kg_max_concurrent=3)
+
+        assert experiment.kg_max_concurrent == 3
+
+    def test_kg_concurrency_rejects_non_positive_values(self):
+        with pytest.raises(ValueError, match="kg_max_concurrent"):
+            _build_experiment(kg_max_concurrent=0)
+
     def test_vector_backend_does_not_initialize_graph_retrieval_configuration(self):
         assert _build_experiment().graph_retrieval_config is None
 

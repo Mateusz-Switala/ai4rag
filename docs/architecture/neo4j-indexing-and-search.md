@@ -94,16 +94,10 @@ Callers can override `chunking_methods`, `chunk_sizes`, and `chunk_overlaps` whe
 
 ### Knowledge-graph extraction
 
-`add_documents()` runs `SimpleKGPipeline` on non-empty chunk text when a foundation model was supplied at store construction or as `model=` to `add_documents()`.
+`add_documents()` runs batched KG extraction on non-empty chunk text when a foundation model was supplied at store construction or as `model=` to `add_documents()`.
 Without a model, it stores only canonical chunks.
-The pipeline uses ai4rag model adapters and a pass-through `_PreChunkedTextSplitter` that returns each existing `AI4RAGChunk` as one unchanged GraphRAG text chunk.
-It does not split recursive or hybrid chunks again.
-Both its async `run()` and GraphRAG chunk-iterator interface preserve the canonical
-text and chunk index. During extraction, ai4rag suppresses GraphRAG's verbose logs
-that include document text, retains warnings/errors, and logs extraction start and
-completion with chunk counts.
-The pipeline uses `on_error="IGNORE"` and processes up to two chunks concurrently by default to reduce pressure on the foundation-model endpoint. Extraction start logs include the concurrency limit.
-For direct `Neo4jGraphStore.add_documents()` calls, pass `kg_max_concurrent` to raise that bounded request concurrency when the foundation-model endpoint has sufficient capacity. Each request still carries one canonical chunk so ai4rag can retain its exact chunk-to-entity provenance.
+The extractor preserves the existing canonical text and chunk ID; it does not split recursive or hybrid chunks again. It batches two chunks per MaaS request by default, asks for JSON-object output, and validates each returned chunk graph locally. During extraction, ai4rag suppresses GraphRAG's verbose logs that include document text, retains warnings/errors, and logs extraction start and completion with chunk counts.
+The default request concurrency is two. Pass `kg_max_concurrent` to `Neo4jGraphStore.add_documents()` or `AI4RAGExperiment` to tune it for the foundation-model endpoint. Retry backoff does not occupy a concurrency slot; malformed batches retry only their failed chunks and then use bounded singleton fallback.
 ai4rag disables GraphRAG's database-wide resolver and optionally resolves entities for this collection after all chunk extraction finishes (enabled by default).
 Each chunk is therefore one KG extraction input; an upstream chunk that is too large for the foundation model can exceed its context limit.
 
