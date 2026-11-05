@@ -585,15 +585,14 @@ class TestAddDocuments:
     def test_kg_pipeline_splits_a_repeatedly_failing_llm_batch(self, mock_driver_cls, mock_embedding, neo4j_config):
         """A transient MaaS failure affects only its batch, not the collection."""
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
-        batch_sizes: list[int] = []
+        completion_limits: list[int] = []
 
         class GatewayError(Exception):
             status_code = 502
 
         async def run_pipeline(_, prompt, completion_limit):
             payload = json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1])
-            batch_sizes.append(len(payload))
-            assert completion_limit == 1024
+            completion_limits.append(completion_limit)
             if len(payload) > 1:
                 raise GatewayError("gateway reset")
             return SimpleNamespace(
@@ -607,8 +606,34 @@ class TestAddDocuments:
         ):
             store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
 
-        assert batch_sizes == [2, 2, 2, 1, 1]
+        assert completion_limits == [1024, 1024, 1024, 2048, 2048]
         assert sleep.await_args_list == [call(1), call(2)]
+
+    def test_kg_pipeline_retries_then_splits_an_improper_batch_response(
+        self, mock_driver_cls, mock_embedding, neo4j_config
+    ):
+        """Malformed output retries once before a larger-budget singleton fallback."""
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        completion_limits: list[int] = []
+
+        async def run_pipeline(_, prompt, completion_limit):
+            payload = json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1])
+            completion_limits.append(completion_limit)
+            if len(payload) > 1:
+                return SimpleNamespace(content='{"chunks":')
+            return SimpleNamespace(
+                content=json.dumps({"chunks": [{"chunk_id": payload[0]["chunk_id"], "nodes": [], "relationships": []}]})
+            )
+
+        with (
+            patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline),
+            patch("ai4rag.rag.vector_store.neo4j.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            patch("ai4rag.rag.vector_store.neo4j.random.uniform", return_value=0),
+        ):
+            store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
+
+        assert completion_limits == [1024, 1024, 2048, 2048]
+        sleep.assert_awaited_once_with(1)
 
     def test_kg_pipeline_ignores_a_failed_single_chunk_by_default(
         self, mock_driver_cls, mock_embedding, neo4j_config, caplog

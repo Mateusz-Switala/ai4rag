@@ -84,11 +84,19 @@ _RETRYABLE_NEO4J_EXCEPTIONS = (
 )
 _RETRYABLE_LLM_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _KG_EXTRACTION_MAX_ATTEMPTS = 3
+_KG_RESPONSE_FORMAT_MAX_ATTEMPTS = 2
 _KG_EXTRACTION_BACKOFF_JITTER_SECONDS = 0.25
+_KG_SINGLE_CHUNK_MAX_COMPLETION_TOKENS = 2048
+
+
+class _KGResponseFormatError(ValueError):
+    """An LLM response could not be decoded as the requested KG batch schema."""
 
 
 def _is_retryable_kg_extraction_error(error: Exception) -> bool:
     """Return whether *error* is transient enough to retry KG extraction."""
+    if isinstance(error, _KGResponseFormatError):
+        return True
     if isinstance(error, _RETRYABLE_NEO4J_EXCEPTIONS):
         return True
     return getattr(error, "status_code", None) in _RETRYABLE_LLM_STATUS_CODES
@@ -371,6 +379,8 @@ class Neo4jGraphStore(BaseVectorStore):
 
             async def _run_one(batch: list[AI4RAGChunk]) -> None:
                 completion_limit = self._kg_extraction_config["max_completion_tokens"]
+                if len(batch) == 1:
+                    completion_limit = max(completion_limit, _KG_SINGLE_CHUNK_MAX_COMPLETION_TOKENS)
                 for attempt in range(1, _KG_EXTRACTION_MAX_ATTEMPTS + 1):
                     try:
                         async with sem:
@@ -385,7 +395,12 @@ class Neo4jGraphStore(BaseVectorStore):
                     except Exception as exc:  # pylint: disable=broad-except
                         if not _is_retryable_kg_extraction_error(exc):
                             raise
-                        if attempt < _KG_EXTRACTION_MAX_ATTEMPTS:
+                        max_attempts = (
+                            _KG_RESPONSE_FORMAT_MAX_ATTEMPTS
+                            if isinstance(exc, _KGResponseFormatError)
+                            else _KG_EXTRACTION_MAX_ATTEMPTS
+                        )
+                        if attempt < max_attempts:
                             delay_seconds = (2 ** (attempt - 1)) + random.uniform(
                                 0, _KG_EXTRACTION_BACKOFF_JITTER_SECONDS
                             )
@@ -395,7 +410,7 @@ class Neo4jGraphStore(BaseVectorStore):
                                 self._collection_name,
                                 [chunk.chunk_id for chunk in batch],
                                 attempt,
-                                _KG_EXTRACTION_MAX_ATTEMPTS,
+                                max_attempts,
                                 delay_seconds,
                                 exc,
                             )
@@ -406,7 +421,7 @@ class Neo4jGraphStore(BaseVectorStore):
                             logger.warning(
                                 "KG extraction failed after %d attempts for collection=%s, chunk_ids=%s; "
                                 "splitting batch into %d and %d chunks.",
-                                _KG_EXTRACTION_MAX_ATTEMPTS,
+                                max_attempts,
                                 self._collection_name,
                                 [chunk.chunk_id for chunk in batch],
                                 midpoint,
@@ -421,7 +436,7 @@ class Neo4jGraphStore(BaseVectorStore):
                             "Skipping KG extraction for collection=%s, chunk_id=%s after %d transient failures: %s",
                             self._collection_name,
                             batch[0].chunk_id,
-                            _KG_EXTRACTION_MAX_ATTEMPTS,
+                            max_attempts,
                             exc,
                         )
                         return
@@ -501,10 +516,7 @@ class Neo4jGraphStore(BaseVectorStore):
             if not isinstance(entries, list):
                 raise ValueError("chunks must be a list")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            if on_error == "RAISE":
-                raise ValueError("KG batch LLM response is not valid JSON with a chunks array.") from exc
-            logger.error("KG batch LLM response has improper format; skipping %d chunks.", len(chunks))
-            return []
+            raise _KGResponseFormatError("KG batch LLM response is not valid JSON with a chunks array.") from exc
 
         graphs: list[tuple[AI4RAGChunk, Neo4jGraph]] = []
         seen_ids: set[str] = set()
