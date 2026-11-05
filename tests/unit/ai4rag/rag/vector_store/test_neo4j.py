@@ -8,7 +8,7 @@ import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import neo4j
 import pytest
@@ -61,7 +61,7 @@ def neo4j_config():
 def mock_batched_kg_requests():
     """Avoid external model calls while preserving the batch response contract."""
 
-    async def respond(_, prompt):
+    async def respond(_, prompt, _completion_limit):
         payload = json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1])
         return SimpleNamespace(
             content=json.dumps(
@@ -70,7 +70,7 @@ def mock_batched_kg_requests():
         )
 
     with (
-        patch.object(_LLMAdapter, "ainvoke", respond),
+        patch.object(_LLMAdapter, "ainvoke_with_completion_limit", respond),
         patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)),
     ):
         yield
@@ -537,7 +537,7 @@ class TestAddDocuments:
             store._run_kg_pipeline(chunks, MagicMock(), perform_entity_resolution=False)
 
         assert (
-            "Starting entity extraction for 2 chunks in 1 batches (batch_size=4, max_concurrent=2, collection=ai4rag_col)."
+            "Starting entity extraction for 2 chunks in 1 batches (batch_size=2, max_concurrent=1, collection=ai4rag_col)."
             in caplog.messages
         )
         assert "Finished entity extraction for 2 chunks (collection=ai4rag_col)." in caplog.messages
@@ -548,7 +548,7 @@ class TestAddDocuments:
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
         calls = 0
 
-        async def run_pipeline(_, prompt):
+        async def run_pipeline(_, prompt, _completion_limit):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -559,12 +559,65 @@ class TestAddDocuments:
             )
 
         with patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)):
-            with patch.object(_LLMAdapter, "ainvoke", run_pipeline):
-                with patch("ai4rag.rag.vector_store.neo4j.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            with patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline):
+                with (
+                    patch("ai4rag.rag.vector_store.neo4j.asyncio.sleep", new_callable=AsyncMock) as sleep,
+                    patch("ai4rag.rag.vector_store.neo4j.random.uniform", return_value=0),
+                ):
                     store._run_kg_pipeline([self._make_chunks(1)[0]], MagicMock(), perform_entity_resolution=False)
 
         assert calls == 2
         sleep.assert_awaited_once_with(1)
+
+    def test_kg_pipeline_splits_a_repeatedly_failing_llm_batch(self, mock_driver_cls, mock_embedding, neo4j_config):
+        """A transient MaaS failure affects only its batch, not the collection."""
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        batch_sizes: list[int] = []
+
+        class GatewayError(Exception):
+            status_code = 502
+
+        async def run_pipeline(_, prompt, completion_limit):
+            payload = json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1])
+            batch_sizes.append(len(payload))
+            assert completion_limit == 256 * len(payload)
+            if len(payload) > 1:
+                raise GatewayError("gateway reset")
+            return SimpleNamespace(
+                content=json.dumps({"chunks": [{"chunk_id": payload[0]["chunk_id"], "nodes": [], "relationships": []}]})
+            )
+
+        with (
+            patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline),
+            patch("ai4rag.rag.vector_store.neo4j.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            patch("ai4rag.rag.vector_store.neo4j.random.uniform", return_value=0),
+        ):
+            store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
+
+        assert batch_sizes == [2, 2, 2, 1, 1]
+        assert sleep.await_args_list == [call(1), call(2)]
+
+    def test_kg_pipeline_ignores_a_failed_single_chunk_by_default(
+        self, mock_driver_cls, mock_embedding, neo4j_config, caplog
+    ):
+        """An unrecoverable transient failure leaves the canonical collection usable."""
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+
+        class GatewayError(Exception):
+            status_code = 502
+
+        async def run_pipeline(*_):
+            raise GatewayError("gateway reset")
+
+        with (
+            caplog.at_level(logging.ERROR),
+            patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline),
+            patch("ai4rag.rag.vector_store.neo4j.asyncio.sleep", new_callable=AsyncMock),
+            patch("ai4rag.rag.vector_store.neo4j.random.uniform", return_value=0),
+        ):
+            store._run_kg_pipeline([self._make_chunks(1)[0]], MagicMock(), perform_entity_resolution=False)
+
+        assert "Skipping KG extraction" in caplog.text
 
     def test_pipeline_can_skip_scoped_entity_resolution(self, mock_driver_cls, mock_embedding, neo4j_config):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")

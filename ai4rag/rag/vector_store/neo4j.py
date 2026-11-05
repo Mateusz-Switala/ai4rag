@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -80,6 +81,17 @@ _RETRYABLE_NEO4J_EXCEPTIONS = (
     neo4j.exceptions.SessionExpired,
     neo4j.exceptions.TransientError,
 )
+_RETRYABLE_LLM_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_KG_EXTRACTION_MAX_ATTEMPTS = 3
+_KG_EXTRACTION_BACKOFF_JITTER_SECONDS = 0.25
+_KG_EXTRACTION_TOKENS_PER_CHUNK = 256
+
+
+def _is_retryable_kg_extraction_error(error: Exception) -> bool:
+    """Return whether *error* is transient enough to retry KG extraction."""
+    if isinstance(error, _RETRYABLE_NEO4J_EXCEPTIONS):
+        return True
+    return getattr(error, "status_code", None) in _RETRYABLE_LLM_STATUS_CODES
 
 
 def _normalize_custom_ca_uri(uri: str) -> str:
@@ -159,7 +171,7 @@ class Neo4jGraphStore(BaseVectorStore):
     """
 
     _BATCH_SIZE = 512
-    _DEFAULT_KG_EXTRACTION_CONCURRENCY = 2
+    _DEFAULT_KG_EXTRACTION_CONCURRENCY = 1
     _VECTOR_INDEX_WAIT_SECONDS = 600
 
     def __init__(
@@ -328,7 +340,7 @@ class Neo4jGraphStore(BaseVectorStore):
         on_error: str = "IGNORE",
         perform_entity_resolution: bool = True,
     ) -> None:
-        """Extract multiple canonical chunks per LLM request and write them separately."""
+        """Extract canonical chunks with resilient batch fallback and write them separately."""
         chunks = [chunk for chunk in chunks if chunk.text.strip()]
         if not chunks:
             return
@@ -354,29 +366,64 @@ class Neo4jGraphStore(BaseVectorStore):
             sem = asyncio.Semaphore(max_concurrent)
 
             async def _run_one(batch: list[AI4RAGChunk]) -> None:
-                async with sem:
-                    for attempt in range(1, _KG_NEO4J_RETRY_ATTEMPTS + 1):
-                        try:
-                            response = await llm.ainvoke(self._build_kg_batch_prompt(batch))
-                            graphs = self._parse_kg_batch_response(response.content, batch, on_error)
-                            for chunk, graph in graphs:
-                                with kg_writer.for_chunk(chunk.chunk_id):
-                                    await kg_writer.run(graph, _KG_LEXICAL_GRAPH_CONFIG)
-                            return
-                        except _RETRYABLE_NEO4J_EXCEPTIONS as exc:
-                            if attempt == _KG_NEO4J_RETRY_ATTEMPTS:
-                                raise
-                            delay_seconds = 2 ** (attempt - 1)
+                completion_limit = min(
+                    self._kg_extraction_config["max_completion_tokens"],
+                    _KG_EXTRACTION_TOKENS_PER_CHUNK * len(batch),
+                )
+                for attempt in range(1, _KG_EXTRACTION_MAX_ATTEMPTS + 1):
+                    try:
+                        async with sem:
+                            response = await llm.ainvoke_with_completion_limit(
+                                self._build_kg_batch_prompt(batch), completion_limit
+                            )
+                        graphs = self._parse_kg_batch_response(response.content, batch, on_error)
+                        for chunk, graph in graphs:
+                            with kg_writer.for_chunk(chunk.chunk_id):
+                                await kg_writer.run(graph, _KG_LEXICAL_GRAPH_CONFIG)
+                        return
+                    except Exception as exc:  # pylint: disable=broad-except
+                        if not _is_retryable_kg_extraction_error(exc):
+                            raise
+                        if attempt < _KG_EXTRACTION_MAX_ATTEMPTS:
+                            delay_seconds = (2 ** (attempt - 1)) + random.uniform(
+                                0, _KG_EXTRACTION_BACKOFF_JITTER_SECONDS
+                            )
                             logger.warning(
-                                "Neo4j connection failed during KG extraction for collection=%s; "
-                                "retrying chunk (%d/%d) in %ds: %s",
+                                "Transient KG extraction failure for collection=%s, chunk_ids=%s; "
+                                "retrying batch (%d/%d) in %.2fs: %s",
                                 self._collection_name,
+                                [chunk.chunk_id for chunk in batch],
                                 attempt,
-                                _KG_NEO4J_RETRY_ATTEMPTS,
+                                _KG_EXTRACTION_MAX_ATTEMPTS,
                                 delay_seconds,
                                 exc,
                             )
                             await asyncio.sleep(delay_seconds)
+                            continue
+                        if len(batch) > 1:
+                            midpoint = len(batch) // 2
+                            logger.warning(
+                                "KG extraction failed after %d attempts for collection=%s, chunk_ids=%s; "
+                                "splitting batch into %d and %d chunks.",
+                                _KG_EXTRACTION_MAX_ATTEMPTS,
+                                self._collection_name,
+                                [chunk.chunk_id for chunk in batch],
+                                midpoint,
+                                len(batch) - midpoint,
+                            )
+                            await _run_one(batch[:midpoint])
+                            await _run_one(batch[midpoint:])
+                            return
+                        if on_error == "RAISE":
+                            raise
+                        logger.error(
+                            "Skipping KG extraction for collection=%s, chunk_id=%s after %d transient failures: %s",
+                            self._collection_name,
+                            batch[0].chunk_id,
+                            _KG_EXTRACTION_MAX_ATTEMPTS,
+                            exc,
+                        )
+                        return
 
             await asyncio.gather(*(_run_one(batch) for batch in batches))
 
