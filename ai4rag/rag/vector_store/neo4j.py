@@ -31,6 +31,8 @@ from ai4rag.rag.vector_store.config import Neo4jConfig
 from ai4rag.rag.vector_store.neo4j_utils import (
     _KG_LEXICAL_GRAPH_CONFIG,
     KG_BATCH_RESPONSE_FORMAT,
+    KG_MAX_ENTITIES_PER_CHUNK,
+    KG_MAX_RELATIONSHIPS_PER_CHUNK,
     Neo4jGraphSchema,
     _build_graph_retrieval_query,
     _CanonicalKGWriter,
@@ -377,16 +379,15 @@ class Neo4jGraphStore(BaseVectorStore):
         async def _run_all() -> None:
             sem = asyncio.Semaphore(max_concurrent)
 
-            async def _run_one(batch: list[AI4RAGChunk]) -> None:
+            async def _process_batch(batch: list[AI4RAGChunk]) -> None:
                 completion_limit = self._kg_extraction_config["max_completion_tokens"]
                 if len(batch) == 1:
                     completion_limit = max(completion_limit, _KG_SINGLE_CHUNK_MAX_COMPLETION_TOKENS)
                 for attempt in range(1, _KG_EXTRACTION_MAX_ATTEMPTS + 1):
                     try:
-                        async with sem:
-                            response = await llm.ainvoke_with_completion_limit(
-                                self._build_kg_batch_prompt(batch), completion_limit
-                            )
+                        response = await llm.ainvoke_with_completion_limit(
+                            self._build_kg_batch_prompt(batch), completion_limit
+                        )
                         graphs = self._parse_kg_batch_response(response.content, batch, on_error)
                         for chunk, graph in graphs:
                             with kg_writer.for_chunk(chunk.chunk_id):
@@ -427,8 +428,8 @@ class Neo4jGraphStore(BaseVectorStore):
                                 midpoint,
                                 len(batch) - midpoint,
                             )
-                            await _run_one(batch[:midpoint])
-                            await _run_one(batch[midpoint:])
+                            await _process_batch(batch[:midpoint])
+                            await _process_batch(batch[midpoint:])
                             return
                         if on_error == "RAISE":
                             raise
@@ -440,6 +441,13 @@ class Neo4jGraphStore(BaseVectorStore):
                             exc,
                         )
                         return
+
+            async def _run_one(batch: list[AI4RAGChunk]) -> None:
+                # Keep this slot through retries and split fallbacks so a
+                # malformed batch is resolved before unrelated batches enter
+                # the model queue.
+                async with sem:
+                    await _process_batch(batch)
 
             await asyncio.gather(*(_run_one(batch) for batch in batches))
 
@@ -496,6 +504,9 @@ class Neo4jGraphStore(BaseVectorStore):
             "Extract a knowledge graph independently for every input chunk. "
             "Never create relationships between different chunk_id values. "
             f"{schema}\n"
+            f"For each chunk, extract at most {KG_MAX_ENTITIES_PER_CHUNK} entities and "
+            f"{KG_MAX_RELATIONSHIPS_PER_CHUNK} relationships. Node properties must contain only "
+            "the entity name. Relationship properties must be empty.\n"
             "Return only this JSON object, with exactly this structure:\n"
             + '{"chunks":[{"chunk_id":"input chunk ID","nodes":[{"id":"local ID","label":"type",'
             + '"properties":{"name":"entity name"}}],"relationships":[{"start_node_id":"local ID",'

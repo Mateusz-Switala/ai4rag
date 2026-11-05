@@ -61,6 +61,8 @@ DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 1024
 # default workload below the MaaS gateway's practical capacity for one model
 # replica while still amortising request overhead.
 DEFAULT_KG_EXTRACTION_BATCH_SIZE = 2
+KG_MAX_ENTITIES_PER_CHUNK = 6
+KG_MAX_RELATIONSHIPS_PER_CHUNK = 6
 KG_BATCH_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
@@ -77,12 +79,18 @@ KG_BATCH_RESPONSE_FORMAT = {
                             "chunk_id": {"type": "string"},
                             "nodes": {
                                 "type": "array",
+                                "maxItems": KG_MAX_ENTITIES_PER_CHUNK,
                                 "items": {
                                     "type": "object",
                                     "properties": {
                                         "id": {"type": "string"},
                                         "label": {"type": "string"},
-                                        "properties": {"type": "object", "additionalProperties": True},
+                                        "properties": {
+                                            "type": "object",
+                                            "properties": {"name": {"type": "string"}},
+                                            "required": ["name"],
+                                            "additionalProperties": False,
+                                        },
                                     },
                                     "required": ["id", "label", "properties"],
                                     "additionalProperties": False,
@@ -90,13 +98,18 @@ KG_BATCH_RESPONSE_FORMAT = {
                             },
                             "relationships": {
                                 "type": "array",
+                                "maxItems": KG_MAX_RELATIONSHIPS_PER_CHUNK,
                                 "items": {
                                     "type": "object",
                                     "properties": {
                                         "start_node_id": {"type": "string"},
                                         "end_node_id": {"type": "string"},
                                         "type": {"type": "string"},
-                                        "properties": {"type": "object", "additionalProperties": True},
+                                        "properties": {
+                                            "type": "object",
+                                            "properties": {},
+                                            "additionalProperties": False,
+                                        },
                                     },
                                     "required": ["start_node_id", "end_node_id", "type", "properties"],
                                     "additionalProperties": False,

@@ -22,6 +22,8 @@ from ai4rag.rag.vector_store.neo4j import (
 from ai4rag.rag.vector_store.neo4j_utils import (
     _KG_LEXICAL_GRAPH_CONFIG,
     KG_BATCH_RESPONSE_FORMAT,
+    KG_MAX_ENTITIES_PER_CHUNK,
+    KG_MAX_RELATIONSHIPS_PER_CHUNK,
     _build_graph_retrieval_query,
     _CanonicalKGWriter,
     _CollectionKGWriter,
@@ -516,9 +518,22 @@ class TestAddDocuments:
         chunk = AI4RAGChunk(text=text, metadata={"document_id": "document.md"})
 
         prompt = store._build_kg_batch_prompt([chunk])
+        assert f"at most {KG_MAX_ENTITIES_PER_CHUNK} entities" in prompt
+        assert f"{KG_MAX_RELATIONSHIPS_PER_CHUNK} relationships" in prompt
         assert json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1]) == [
             {"chunk_id": chunk.chunk_id, "text": text}
         ]
+
+    def test_kg_response_schema_bounds_graph_size_and_properties(self, _mock_driver_cls):
+        """The enforced schema keeps batch responses below the output budget."""
+        chunk_schema = KG_BATCH_RESPONSE_FORMAT["json_schema"]["schema"]["properties"]["chunks"]["items"]
+
+        assert chunk_schema["properties"]["nodes"]["maxItems"] == KG_MAX_ENTITIES_PER_CHUNK
+        assert chunk_schema["properties"]["relationships"]["maxItems"] == KG_MAX_RELATIONSHIPS_PER_CHUNK
+        node_properties = chunk_schema["properties"]["nodes"]["items"]["properties"]["properties"]
+        relationship_properties = chunk_schema["properties"]["relationships"]["items"]["properties"]["properties"]
+        assert node_properties["properties"] == {"name": {"type": "string"}}
+        assert relationship_properties["additionalProperties"] is False
 
     def test_kg_pipeline_does_not_log_chunk_text(self, mock_driver_cls, mock_embedding, neo4j_config, caplog):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
