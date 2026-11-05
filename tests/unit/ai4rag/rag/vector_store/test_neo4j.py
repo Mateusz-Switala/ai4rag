@@ -7,7 +7,8 @@ import json
 import logging
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import neo4j
 import pytest
@@ -26,7 +27,6 @@ from ai4rag.rag.vector_store.neo4j_utils import (
     _EmbedderAdapter,
     _kg_pipeline_extraction_options,
     _LLMAdapter,
-    _PreChunkedTextSplitter,
     _validate_kg_extraction_config,
     _validate_neo4j_search_params,
 )
@@ -57,6 +57,25 @@ def neo4j_config():
     return Neo4jConfig(uri="neo4j://localhost:7687", username="neo4j", password="test")
 
 
+@pytest.fixture(autouse=True)
+def mock_batched_kg_requests():
+    """Avoid external model calls while preserving the batch response contract."""
+
+    async def respond(_, prompt):
+        payload = json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1])
+        return SimpleNamespace(
+            content=json.dumps(
+                {"chunks": [{"chunk_id": item["chunk_id"], "nodes": [], "relationships": []} for item in payload]}
+            )
+        )
+
+    with (
+        patch.object(_LLMAdapter, "ainvoke", respond),
+        patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)),
+    ):
+        yield
+
+
 def _make_store(mock_driver_cls, mock_embedding, neo4j_config, collection_name="ai4rag_test"):
     """Construct a Neo4jGraphStore with a fully mocked neo4j driver."""
     store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name=collection_name)
@@ -82,6 +101,22 @@ def test_llm_adapter_can_override_the_completion_limit_for_entity_extraction():
     _LLMAdapter(model, max_completion_tokens=1024).invoke("Extract entities.")
 
     model.chat.assert_called_once_with([{"role": "user", "content": "Extract entities."}], max_completion_tokens=1024)
+
+
+def test_llm_adapter_repairs_fenced_singleton_kg_response():
+    model = MagicMock(model_id="test-model")
+    model.chat.return_value = [
+        {
+            "role": "assistant",
+            "content": '```json\n[{"entities": [], "relations": []}]\n```',
+        }
+    ]
+    adapter = _LLMAdapter(model)
+
+    response = adapter.invoke("Extract entities.")
+
+    assert json.loads(response.content) == {"nodes": [], "relationships": []}
+    assert adapter.metrics[2] == 1
 
 
 def test_kg_embedder_reuses_canonical_embedding(mock_embedding):
@@ -449,27 +484,7 @@ class TestAddDocuments:
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
         chunk = self._make_chunks(1)[0]
         session = mock_driver_cls.return_value.session.return_value.__enter__.return_value
-
-        async def run_pipeline(*args, **kwargs):
-            assert pipeline_cls.call_args.kwargs["kg_writer"]._chunk_id.get() == chunk.chunk_id
-            return MagicMock()
-
-        with patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)):
-            with patch("ai4rag.rag.vector_store.neo4j.SimpleKGPipeline") as pipeline_cls:
-                pipeline_cls.return_value.run_async.side_effect = run_pipeline
-                store.add_documents([chunk], model=MagicMock())
-
-        assert isinstance(pipeline_cls.call_args.kwargs["kg_writer"], _CanonicalKGWriter)
-        assert isinstance(pipeline_cls.call_args.kwargs["text_splitter"], _PreChunkedTextSplitter)
-        assert pipeline_cls.call_args.kwargs["perform_entity_resolution"] is False
-        lexical_config = pipeline_cls.call_args.kwargs["lexical_graph_config"]
-        assert lexical_config.document_node_label != "Document"
-        assert lexical_config.chunk_node_label != "Chunk"
-        assert (
-            pipeline_cls.return_value.run_async.call_args.kwargs["document_metadata"]["ai4rag_chunk_id"]
-            == chunk.chunk_id
-        )
-        assert pipeline_cls.call_args.kwargs["kg_writer"]._chunk_id.get() is None
+        store.add_documents([chunk], model=MagicMock())
         assert not any("SET kc:ai4rag_col" in call.args[0] for call in session.run.call_args_list)
         resolution_call = next(
             call for call in session.run.call_args_list if "apoc.refactor.mergeNodes" in call.args[0]
@@ -482,25 +497,15 @@ class TestAddDocuments:
         assert "SET node.ai4rag_kg_collections = reduce(" in resolution_query
         assert resolution_call.kwargs["col"] == "ai4rag_col"
 
-    def test_kg_pipeline_preserves_pre_chunked_text(self, mock_driver_cls, mock_embedding, neo4j_config):
+    def test_kg_pipeline_prompt_preserves_canonical_chunk_text(self, mock_driver_cls, mock_embedding, neo4j_config):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
         text = "A long canonical chunk. " * 200
         chunk = AI4RAGChunk(text=text, metadata={"document_id": "document.md"})
 
-        async def run_pipeline(*args, **kwargs):
-            return MagicMock()
-
-        with patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)):
-            with patch("ai4rag.rag.vector_store.neo4j.SimpleKGPipeline") as pipeline_cls:
-                pipeline_cls.return_value.run_async.side_effect = run_pipeline
-                store.add_documents([chunk], model=MagicMock())
-
-        splitter = pipeline_cls.call_args.kwargs["text_splitter"]
-        for chunks in (list(splitter.iter_chunks(text)), asyncio.run(splitter.run(text)).chunks):
-            assert len(chunks) == 1
-            assert chunks[0].text == text
-            assert chunks[0].index == 0
-        assert pipeline_cls.return_value.run_async.call_args.kwargs["text"] == text
+        prompt = store._build_kg_batch_prompt([chunk])
+        assert json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1]) == [
+            {"chunk_id": chunk.chunk_id, "text": text}
+        ]
 
     def test_kg_pipeline_does_not_log_chunk_text(self, mock_driver_cls, mock_embedding, neo4j_config, caplog):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
@@ -509,18 +514,12 @@ class TestAddDocuments:
         graphrag_logger = logging.getLogger("neo4j_graphrag.experimental.pipeline.config.runner")
         original_level = graphrag_logger.level
 
-        async def run_pipeline(*args, **kwargs):
-            graphrag_logger.info("PIPELINE_RUNNER: run_params={'splitter': {'text': %r}}", secret_text)
-            return MagicMock()
-
         try:
             with (
                 caplog.at_level(logging.INFO),
                 patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)),
             ):
-                with patch("ai4rag.rag.vector_store.neo4j.SimpleKGPipeline") as pipeline_cls:
-                    pipeline_cls.return_value.run_async.side_effect = run_pipeline
-                    store.add_documents([chunk], model=MagicMock())
+                store.add_documents([chunk], model=MagicMock())
         finally:
             assert graphrag_logger.level == original_level
 
@@ -531,33 +530,47 @@ class TestAddDocuments:
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
         chunks = self._make_chunks(2)
 
-        async def run_pipeline(*args, **kwargs):
-            return MagicMock()
-
         with (
             caplog.at_level(logging.INFO),
             patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)),
         ):
-            with patch("ai4rag.rag.vector_store.neo4j.SimpleKGPipeline") as pipeline_cls:
-                pipeline_cls.return_value.run_async.side_effect = run_pipeline
-                store._run_kg_pipeline(chunks, MagicMock(), perform_entity_resolution=False)
+            store._run_kg_pipeline(chunks, MagicMock(), perform_entity_resolution=False)
 
-        assert "Starting entity extraction for 2 chunks (max_concurrent=2, collection=ai4rag_col)." in caplog.messages
+        assert (
+            "Starting entity extraction for 2 chunks in 1 batches (batch_size=4, max_concurrent=2, collection=ai4rag_col)."
+            in caplog.messages
+        )
         assert "Finished entity extraction for 2 chunks (collection=ai4rag_col)." in caplog.messages
+
+    def test_kg_pipeline_retries_transient_neo4j_connection_failure(
+        self, mock_driver_cls, mock_embedding, neo4j_config
+    ):
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        calls = 0
+
+        async def run_pipeline(_, prompt):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise neo4j.exceptions.ServiceUnavailable("routing unavailable")
+            chunk_id = json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1])[0]["chunk_id"]
+            return SimpleNamespace(
+                content=json.dumps({"chunks": [{"chunk_id": chunk_id, "nodes": [], "relationships": []}]})
+            )
+
+        with patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)):
+            with patch.object(_LLMAdapter, "ainvoke", run_pipeline):
+                with patch("ai4rag.rag.vector_store.neo4j.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                    store._run_kg_pipeline([self._make_chunks(1)[0]], MagicMock(), perform_entity_resolution=False)
+
+        assert calls == 2
+        sleep.assert_awaited_once_with(1)
 
     def test_pipeline_can_skip_scoped_entity_resolution(self, mock_driver_cls, mock_embedding, neo4j_config):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
         session = mock_driver_cls.return_value.session.return_value.__enter__.return_value
 
-        async def run_pipeline(*args, **kwargs):
-            return MagicMock()
-
-        with patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)):
-            with patch("ai4rag.rag.vector_store.neo4j.SimpleKGPipeline") as pipeline_cls:
-                pipeline_cls.return_value.run_async.side_effect = run_pipeline
-                store._run_kg_pipeline([self._make_chunks(1)[0]], MagicMock(), perform_entity_resolution=False)
-
-        assert pipeline_cls.call_args.kwargs["perform_entity_resolution"] is False
+        store._run_kg_pipeline([self._make_chunks(1)[0]], MagicMock(), perform_entity_resolution=False)
         assert not any("apoc.refactor.mergeNodes" in call.args[0] for call in session.run.call_args_list)
 
 
@@ -772,21 +785,14 @@ class TestBuildKnowledgeGraphFromDocuments:
         tx = MagicMock()
         session.execute_write.side_effect = lambda fn, *args: fn(tx, *args)
 
-        async def run_pipeline(*args, **kwargs):
-            return MagicMock()
-
-        with patch("neo4j_graphrag.components.kg_writer.get_version", return_value=((5, 26, 0), False, False)):
-            with patch("ai4rag.rag.vector_store.neo4j.SimpleKGPipeline") as pipeline_cls:
-                pipeline_cls.return_value.run_async.side_effect = run_pipeline
-                store.build_knowledge_graph_from_documents(
-                    documents=[self._make_docling_doc("Alice works at Acme.")], model=MagicMock()
-                )
+        store.build_knowledge_graph_from_documents(
+            documents=[self._make_docling_doc("Alice works at Acme.")], model=MagicMock()
+        )
 
         queries = [call.args[0] for call in tx.run.call_args_list]
         assert sum("MERGE (d:ai4rag_col:Document" in query for query in queries) == 1
         assert sum("MERGE (c:ai4rag_col:Chunk" in query for query in queries) == 1
         assert not any("FROM_DOCUMENT" in query for query in queries)
-        assert isinstance(pipeline_cls.call_args.kwargs["kg_writer"], _CanonicalKGWriter)
 
 
 def test_collection_writer_tags_only_upserted_relationships():
@@ -800,6 +806,7 @@ def test_collection_writer_tags_only_upserted_relationships():
     assert "CALL apoc.merge.relationship(start, row.type" in query
     assert "MATCH (start:__KGBuilder__ {__tmp_internal_id: row.start_node_id})," not in query
     assert "WITH start, row MATCH (end:__KGBuilder__" in query
+    assert "CALL (rel, row) {" in query
     assert "SET rel.ai4rag_kg_collections = CASE" in query
     assert "WHEN $col IN COALESCE(rel.ai4rag_kg_collections, [])" in query
     assert parameters["col"] == "ai4rag_col"

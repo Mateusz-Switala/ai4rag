@@ -7,7 +7,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import uuid
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -18,7 +17,7 @@ from typing import Any
 import neo4j
 from docling_core.types.doc import DoclingDocument
 from neo4j_graphrag.components.text_splitters.fixed_size_splitter import FixedSizeSplitter
-from neo4j_graphrag.experimental.pipeline.kg_builder import SimpleKGPipeline
+from neo4j_graphrag.components.types import Neo4jGraph
 from neo4j_graphrag.retrievers import VectorCypherRetriever, VectorRetriever
 from neo4j_graphrag.types import RetrieverResultItem
 
@@ -35,9 +34,7 @@ from ai4rag.rag.vector_store.neo4j_utils import (
     _CanonicalKGWriter,
     _collection_vector_index_name,
     _EmbedderAdapter,
-    _kg_pipeline_extraction_options,
     _LLMAdapter,
-    _PreChunkedTextSplitter,
     _validate_kg_extraction_config,
     _validate_neo4j_search_params,
 )
@@ -77,6 +74,12 @@ def _suppress_neo4j_graphrag_info_logs() -> Iterator[None]:
 
 
 _CUSTOM_CA_URI_SCHEMES = {"neo4j+s": "neo4j", "bolt+s": "bolt"}
+_KG_NEO4J_RETRY_ATTEMPTS = 3
+_RETRYABLE_NEO4J_EXCEPTIONS = (
+    neo4j.exceptions.ServiceUnavailable,
+    neo4j.exceptions.SessionExpired,
+    neo4j.exceptions.TransientError,
+)
 
 
 def _normalize_custom_ca_uri(uri: str) -> str:
@@ -300,7 +303,6 @@ class Neo4jGraphStore(BaseVectorStore):
         if model is not None:
             self._run_kg_pipeline(
                 chunks=[chunk for chunk, _ in unique_pairs],
-                canonical_embeddings={chunk.text: embedding for chunk, embedding in unique_pairs},
                 model=model,
                 max_concurrent=self._get_kg_max_concurrent(kwargs),
                 on_error=kwargs.get("on_error", "IGNORE"),
@@ -322,29 +324,22 @@ class Neo4jGraphStore(BaseVectorStore):
         self,
         chunks: list[AI4RAGChunk],
         model: Any,
-        canonical_embeddings: Mapping[str, list[float]] | None = None,
         max_concurrent: int = _DEFAULT_KG_EXTRACTION_CONCURRENCY,
         on_error: str = "IGNORE",
         perform_entity_resolution: bool = True,
     ) -> None:
-        """Run ``SimpleKGPipeline`` on chunk texts concurrently.
-
-        Constrained extraction supplies entity/relation types; free extraction
-        supplies an empty schema. Both use ``SchemaBuilder`` rather than
-        ``SchemaFromTextExtractor``, which sends the entire input text in one
-        LLM call and can exceed context limits for large corpora.
-
-        Chunks are processed concurrently (bounded by ``max_concurrent``) inside
-        a single asyncio event loop. The default of two balances throughput
-        with pressure on the foundation-model endpoint.
-        """
+        """Extract multiple canonical chunks per LLM request and write them separately."""
         chunks = [chunk for chunk in chunks if chunk.text.strip()]
         if not chunks:
             return
 
+        batch_size = self._kg_extraction_config["batch_size"]
+        batches = [chunks[index : index + batch_size] for index in range(0, len(chunks), batch_size)]
         logger.info(
-            "Starting entity extraction for %d chunks (max_concurrent=%d, collection=%s).",
+            "Starting entity extraction for %d chunks in %d batches (batch_size=%d, max_concurrent=%d, collection=%s).",
             len(chunks),
+            len(batches),
+            batch_size,
             max_concurrent,
             self._collection_name,
         )
@@ -354,42 +349,36 @@ class Neo4jGraphStore(BaseVectorStore):
         # pipeline invocation calls this hook, but subsequent calls are no-ops.
         kg_writer.ensure_setup()
         llm = _LLMAdapter(model, max_completion_tokens=self._kg_extraction_config["max_completion_tokens"])
-        embedder = _EmbedderAdapter(self.embedding_model, canonical_embeddings)
-        pipeline = SimpleKGPipeline(
-            llm=llm,
-            driver=self._driver,
-            embedder=embedder,
-            from_pdf=False,
-            text_splitter=_PreChunkedTextSplitter(),
-            on_error=on_error,
-            # GraphRAG's built-in resolver scans every __Entity__ in the DB.
-            # Resolve only this collection after all chunks have been written.
-            perform_entity_resolution=False,
-            kg_writer=kg_writer,
-            lexical_graph_config=_KG_LEXICAL_GRAPH_CONFIG,
-            neo4j_database=self._config.database,
-            **_kg_pipeline_extraction_options(self._kg_extraction_config),
-        )
-
-        run_id = uuid.uuid4().hex
 
         async def _run_all() -> None:
             sem = asyncio.Semaphore(max_concurrent)
 
-            async def _run_one(chunk: AI4RAGChunk) -> None:
+            async def _run_one(batch: list[AI4RAGChunk]) -> None:
                 async with sem:
-                    with kg_writer.for_chunk(chunk.chunk_id):
-                        await pipeline.run_async(
-                            file_path=f"ai4rag://{self._collection_name}/{run_id}/{uuid.uuid4().hex}",
-                            text=chunk.text,
-                            document_metadata={
-                                "ai4rag_chunk_id": chunk.chunk_id,
-                                "document_id": chunk.metadata.get("document_id", chunk.chunk_id),
-                                "source": chunk.metadata.get("source", ""),
-                            },
-                        )
+                    for attempt in range(1, _KG_NEO4J_RETRY_ATTEMPTS + 1):
+                        try:
+                            response = await llm.ainvoke(self._build_kg_batch_prompt(batch))
+                            graphs = self._parse_kg_batch_response(response.content, batch, on_error)
+                            for chunk, graph in graphs:
+                                with kg_writer.for_chunk(chunk.chunk_id):
+                                    await kg_writer.run(graph, _KG_LEXICAL_GRAPH_CONFIG)
+                            return
+                        except _RETRYABLE_NEO4J_EXCEPTIONS as exc:
+                            if attempt == _KG_NEO4J_RETRY_ATTEMPTS:
+                                raise
+                            delay_seconds = 2 ** (attempt - 1)
+                            logger.warning(
+                                "Neo4j connection failed during KG extraction for collection=%s; "
+                                "retrying chunk (%d/%d) in %ds: %s",
+                                self._collection_name,
+                                attempt,
+                                _KG_NEO4J_RETRY_ATTEMPTS,
+                                delay_seconds,
+                                exc,
+                            )
+                            await asyncio.sleep(delay_seconds)
 
-            await asyncio.gather(*(_run_one(chunk) for chunk in chunks))
+            await asyncio.gather(*(_run_one(batch) for batch in batches))
 
         try:
             with _suppress_neo4j_graphrag_info_logs():
@@ -414,17 +403,13 @@ class Neo4jGraphStore(BaseVectorStore):
         if perform_entity_resolution:
             self._resolve_kg_entities()
 
-        llm_calls, llm_elapsed_seconds = llm.metrics
-        embedding_calls, embedding_cache_hits, embedding_elapsed_seconds = embedder.metrics
+        llm_calls, llm_elapsed_seconds, llm_format_repairs = llm.metrics
         logger.info(
-            "KG phases for collection=%s: LLM=%d calls/%.2fs, embeddings=%d model calls/"
-            "%d cache hits/%.2fs, graph writes=%.2fs.",
+            "KG phases for collection=%s: LLM=%d calls/%.2fs/%d response repairs, " + "graph writes=%.2fs.",
             self._collection_name,
             llm_calls,
             llm_elapsed_seconds,
-            embedding_calls,
-            embedding_cache_hits,
-            embedding_elapsed_seconds,
+            llm_format_repairs,
             kg_writer.write_elapsed_seconds,
         )
 
@@ -433,6 +418,69 @@ class Neo4jGraphStore(BaseVectorStore):
             len(chunks),
             self._collection_name,
         )
+
+    def _build_kg_batch_prompt(self, chunks: list[AI4RAGChunk]) -> str:
+        """Build the strict, provenance-preserving extraction request for one batch."""
+        if self._kg_extraction_config["mode"] == "constrained":
+            schema = (
+                "Node labels: Person, Organization, Place, Concept, Event, Product, Technology. "
+                "Relationship types: RELATED_TO, PART_OF, LOCATED_IN, BELONGS_TO, CREATED_BY, MENTIONS."
+            )
+        else:
+            schema = "Choose concise node labels and relationship types supported by the text."
+        payload = [{"chunk_id": chunk.chunk_id, "text": chunk.text} for chunk in chunks]
+        return (
+            "Extract a knowledge graph independently for every input chunk. "
+            "Never create relationships between different chunk_id values. "
+            f"{schema}\n"
+            "Return only this JSON object, with exactly this structure:\n"
+            + '{"chunks":[{"chunk_id":"input chunk ID","nodes":[{"id":"local ID","label":"type",'
+            + '"properties":{"name":"entity name"}}],"relationships":[{"start_node_id":"local ID",'
+            + '"end_node_id":"local ID","type":"RELATIONSHIP","properties":{}}]}]}\n'
+            "Every input chunk_id must appear exactly once, including chunks with no entities (empty arrays).\n"
+            f"Input chunks:\n{json.dumps(payload)}"
+        )
+
+    @staticmethod
+    def _parse_kg_batch_response(
+        content: str, chunks: list[AI4RAGChunk], on_error: str
+    ) -> list[tuple[AI4RAGChunk, Neo4jGraph]]:
+        """Validate a batched model result and retain only requested canonical chunks."""
+        chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+        try:
+            result = json.loads(content)
+            entries = result["chunks"]
+            if not isinstance(entries, list):
+                raise ValueError("chunks must be a list")
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            if on_error == "RAISE":
+                raise ValueError("KG batch LLM response is not valid JSON with a chunks array.") from exc
+            logger.error("KG batch LLM response has improper format; skipping %d chunks.", len(chunks))
+            return []
+
+        graphs: list[tuple[AI4RAGChunk, Neo4jGraph]] = []
+        seen_ids: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            chunk_id = entry.get("chunk_id")
+            if not isinstance(chunk_id, str) or chunk_id not in chunk_by_id or chunk_id in seen_ids:
+                continue
+            try:
+                graph = Neo4jGraph.model_validate(
+                    {"nodes": entry.get("nodes", []), "relationships": entry.get("relationships", [])}
+                )
+            except ValueError:
+                if on_error == "RAISE":
+                    raise
+                logger.error("KG batch LLM response has improper graph format for one chunk.")
+                continue
+            seen_ids.add(chunk_id)
+            graphs.append((chunk_by_id[chunk_id], graph))
+        missing_count = len(chunk_by_id) - len(seen_ids)
+        if missing_count:
+            logger.warning("KG batch LLM response omitted or invalidated %d requested chunks.", missing_count)
+        return graphs
 
     def _resolve_kg_entities(self) -> None:
         """Merge same-type, same-name entities exclusive to this collection."""
