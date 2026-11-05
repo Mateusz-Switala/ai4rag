@@ -21,6 +21,7 @@ from ai4rag.rag.vector_store.neo4j import (
 )
 from ai4rag.rag.vector_store.neo4j_utils import (
     _KG_LEXICAL_GRAPH_CONFIG,
+    KG_BATCH_RESPONSE_FORMAT,
     _build_graph_retrieval_query,
     _CanonicalKGWriter,
     _CollectionKGWriter,
@@ -101,6 +102,18 @@ def test_llm_adapter_can_override_the_completion_limit_for_entity_extraction():
     _LLMAdapter(model, max_completion_tokens=1024).invoke("Extract entities.")
 
     model.chat.assert_called_once_with([{"role": "user", "content": "Extract entities."}], max_completion_tokens=1024)
+
+
+def test_llm_adapter_can_require_a_json_schema_response():
+    """KG extraction can request server-enforced structured output."""
+    model = MagicMock(model_id="test-model")
+    model.chat.return_value = [{"role": "assistant", "content": '{"chunks": []}'}]
+
+    _LLMAdapter(model, response_format=KG_BATCH_RESPONSE_FORMAT).invoke("Extract entities.")
+
+    model.chat.assert_called_once_with(
+        [{"role": "user", "content": "Extract entities."}], response_format=KG_BATCH_RESPONSE_FORMAT
+    )
 
 
 def test_llm_adapter_repairs_fenced_singleton_kg_response():
@@ -580,7 +593,7 @@ class TestAddDocuments:
         async def run_pipeline(_, prompt, completion_limit):
             payload = json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1])
             batch_sizes.append(len(payload))
-            assert completion_limit == 256 * len(payload)
+            assert completion_limit == 1024
             if len(payload) > 1:
                 raise GatewayError("gateway reset")
             return SimpleNamespace(

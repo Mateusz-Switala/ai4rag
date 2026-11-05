@@ -30,6 +30,7 @@ from ai4rag.rag.vector_store.base_vector_store import BaseVectorStore
 from ai4rag.rag.vector_store.config import Neo4jConfig
 from ai4rag.rag.vector_store.neo4j_utils import (
     _KG_LEXICAL_GRAPH_CONFIG,
+    KG_BATCH_RESPONSE_FORMAT,
     Neo4jGraphSchema,
     _build_graph_retrieval_query,
     _CanonicalKGWriter,
@@ -84,7 +85,6 @@ _RETRYABLE_NEO4J_EXCEPTIONS = (
 _RETRYABLE_LLM_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _KG_EXTRACTION_MAX_ATTEMPTS = 3
 _KG_EXTRACTION_BACKOFF_JITTER_SECONDS = 0.25
-_KG_EXTRACTION_TOKENS_PER_CHUNK = 256
 
 
 def _is_retryable_kg_extraction_error(error: Exception) -> bool:
@@ -360,16 +360,17 @@ class Neo4jGraphStore(BaseVectorStore):
         # Ensure the shared temporary-node index before task fan-out. Each
         # pipeline invocation calls this hook, but subsequent calls are no-ops.
         kg_writer.ensure_setup()
-        llm = _LLMAdapter(model, max_completion_tokens=self._kg_extraction_config["max_completion_tokens"])
+        llm = _LLMAdapter(
+            model,
+            max_completion_tokens=self._kg_extraction_config["max_completion_tokens"],
+            response_format=KG_BATCH_RESPONSE_FORMAT,
+        )
 
         async def _run_all() -> None:
             sem = asyncio.Semaphore(max_concurrent)
 
             async def _run_one(batch: list[AI4RAGChunk]) -> None:
-                completion_limit = min(
-                    self._kg_extraction_config["max_completion_tokens"],
-                    _KG_EXTRACTION_TOKENS_PER_CHUNK * len(batch),
-                )
+                completion_limit = self._kg_extraction_config["max_completion_tokens"]
                 for attempt in range(1, _KG_EXTRACTION_MAX_ATTEMPTS + 1):
                     try:
                         async with sem:

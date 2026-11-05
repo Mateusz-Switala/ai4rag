@@ -61,6 +61,58 @@ DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 1024
 # default workload below the MaaS gateway's practical capacity for one model
 # replica while still amortising request overhead.
 DEFAULT_KG_EXTRACTION_BATCH_SIZE = 2
+KG_BATCH_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "knowledge_graph_batch",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "chunks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "chunk_id": {"type": "string"},
+                            "nodes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "label": {"type": "string"},
+                                        "properties": {"type": "object", "additionalProperties": True},
+                                    },
+                                    "required": ["id", "label", "properties"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "relationships": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "start_node_id": {"type": "string"},
+                                        "end_node_id": {"type": "string"},
+                                        "type": {"type": "string"},
+                                        "properties": {"type": "object", "additionalProperties": True},
+                                    },
+                                    "required": ["start_node_id", "end_node_id", "type", "properties"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["chunk_id", "nodes", "relationships"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["chunks"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # GraphRAG's lexical nodes are temporary: _CanonicalKGWriter discards them in
 # favor of the canonical nodes already stored by add_documents. Keep their
@@ -190,10 +242,16 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
     parses it.
     """
 
-    def __init__(self, model: BaseFoundationModel, max_completion_tokens: int | None = None) -> None:
+    def __init__(
+        self,
+        model: BaseFoundationModel,
+        max_completion_tokens: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(model_name=model.model_id)
         self._model = model
         self._max_completion_tokens = max_completion_tokens
+        self._response_format = dict(response_format) if response_format is not None else None
         self._calls = 0
         self._elapsed_seconds = 0.0
         self._format_repairs = 0
@@ -220,6 +278,8 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": input})
         kwargs = {"max_completion_tokens": max_completion_tokens} if max_completion_tokens is not None else {}
+        if self._response_format is not None:
+            kwargs["response_format"] = self._response_format
         started_at = perf_counter()
         response = self._model.chat(messages, **kwargs)[0]
         with self._metrics_lock:
