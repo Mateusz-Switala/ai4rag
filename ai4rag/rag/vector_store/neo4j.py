@@ -88,7 +88,6 @@ _RETRYABLE_LLM_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _KG_EXTRACTION_MAX_ATTEMPTS = 3
 _KG_RESPONSE_FORMAT_MAX_ATTEMPTS = 2
 _KG_EXTRACTION_BACKOFF_JITTER_SECONDS = 0.25
-_KG_SINGLE_CHUNK_MAX_COMPLETION_TOKENS = 2048
 
 
 class _KGResponseFormatError(ValueError):
@@ -181,7 +180,7 @@ class Neo4jGraphStore(BaseVectorStore):
     """
 
     _BATCH_SIZE = 512
-    _DEFAULT_KG_EXTRACTION_CONCURRENCY = 1
+    _DEFAULT_KG_EXTRACTION_CONCURRENCY = 2
     _VECTOR_INDEX_WAIT_SECONDS = 600
 
     def __init__(
@@ -379,20 +378,29 @@ class Neo4jGraphStore(BaseVectorStore):
         async def _run_all() -> None:
             sem = asyncio.Semaphore(max_concurrent)
 
-            async def _process_batch(batch: list[AI4RAGChunk]) -> None:
-                completion_limit = self._kg_extraction_config["max_completion_tokens"]
-                if len(batch) == 1:
-                    completion_limit = max(completion_limit, _KG_SINGLE_CHUNK_MAX_COMPLETION_TOKENS)
+            async def _request(batch: list[AI4RAGChunk]):
+                """Issue one request without holding a slot during retry backoff."""
+                async with sem:
+                    return await llm.ainvoke_with_completion_limit(
+                        self._build_kg_batch_prompt(batch), self._kg_extraction_config["max_completion_tokens"]
+                    )
+
+            async def _process_batch(batch: list[AI4RAGChunk], allow_singleton_fallback: bool = True) -> None:
+                """Extract one batch with bounded retries and isolated failed chunks."""
+                pending = batch
                 for attempt in range(1, _KG_EXTRACTION_MAX_ATTEMPTS + 1):
                     try:
-                        response = await llm.ainvoke_with_completion_limit(
-                            self._build_kg_batch_prompt(batch), completion_limit
-                        )
-                        graphs = self._parse_kg_batch_response(response.content, batch, on_error)
+                        response = await _request(pending)
+                        graphs, missing = self._parse_kg_batch_response(response.content, pending, on_error)
                         for chunk, graph in graphs:
                             with kg_writer.for_chunk(chunk.chunk_id):
                                 await kg_writer.run(graph, _KG_LEXICAL_GRAPH_CONFIG)
-                        return
+                        if not missing:
+                            return
+                        pending = missing
+                        raise _KGResponseFormatError(
+                            f"KG batch LLM response omitted or invalidated {len(missing)} requested chunks."
+                        )
                     except Exception as exc:  # pylint: disable=broad-except
                         if not _is_retryable_kg_extraction_error(exc):
                             raise
@@ -401,6 +409,10 @@ class Neo4jGraphStore(BaseVectorStore):
                             if isinstance(exc, _KGResponseFormatError)
                             else _KG_EXTRACTION_MAX_ATTEMPTS
                         )
+                        # Singleton fallback is a final, bounded probe. Do
+                        # not multiply a failed batch's retry budget again.
+                        if not allow_singleton_fallback:
+                            max_attempts = 1
                         if attempt < max_attempts:
                             delay_seconds = (2 ** (attempt - 1)) + random.uniform(
                                 0, _KG_EXTRACTION_BACKOFF_JITTER_SECONDS
@@ -409,7 +421,7 @@ class Neo4jGraphStore(BaseVectorStore):
                                 "Transient KG extraction failure for collection=%s, chunk_ids=%s; "
                                 "retrying batch (%d/%d) in %.2fs: %s",
                                 self._collection_name,
-                                [chunk.chunk_id for chunk in batch],
+                                [chunk.chunk_id for chunk in pending],
                                 attempt,
                                 max_attempts,
                                 delay_seconds,
@@ -417,39 +429,28 @@ class Neo4jGraphStore(BaseVectorStore):
                             )
                             await asyncio.sleep(delay_seconds)
                             continue
-                        if len(batch) > 1:
-                            midpoint = len(batch) // 2
+                        if len(pending) > 1 and allow_singleton_fallback:
                             logger.warning(
                                 "KG extraction failed after %d attempts for collection=%s, chunk_ids=%s; "
-                                "splitting batch into %d and %d chunks.",
+                                "retrying failed chunks individually.",
                                 max_attempts,
                                 self._collection_name,
-                                [chunk.chunk_id for chunk in batch],
-                                midpoint,
-                                len(batch) - midpoint,
+                                [chunk.chunk_id for chunk in pending],
                             )
-                            await _process_batch(batch[:midpoint])
-                            await _process_batch(batch[midpoint:])
+                            await asyncio.gather(*(_process_batch([chunk], False) for chunk in pending))
                             return
                         if on_error == "RAISE":
                             raise
                         logger.error(
                             "Skipping KG extraction for collection=%s, chunk_id=%s after %d transient failures: %s",
                             self._collection_name,
-                            batch[0].chunk_id,
+                            pending[0].chunk_id,
                             max_attempts,
                             exc,
                         )
                         return
 
-            async def _run_one(batch: list[AI4RAGChunk]) -> None:
-                # Keep this slot through retries and split fallbacks so a
-                # malformed batch is resolved before unrelated batches enter
-                # the model queue.
-                async with sem:
-                    await _process_batch(batch)
-
-            await asyncio.gather(*(_run_one(batch) for batch in batches))
+            await asyncio.gather(*(_process_batch(batch) for batch in batches))
 
         try:
             with _suppress_neo4j_graphrag_info_logs():
@@ -497,15 +498,19 @@ class Neo4jGraphStore(BaseVectorStore):
                 "Node labels: Person, Organization, Place, Concept, Event, Product, Technology. "
                 "Relationship types: RELATED_TO, PART_OF, LOCATED_IN, BELONGS_TO, CREATED_BY, MENTIONS."
             )
+            max_entities = KG_MAX_ENTITIES_PER_CHUNK
+            max_relationships = KG_MAX_RELATIONSHIPS_PER_CHUNK
         else:
             schema = "Choose concise node labels and relationship types supported by the text."
+            max_entities = self._kg_extraction_config["max_entities_per_chunk"]
+            max_relationships = self._kg_extraction_config["max_relationships_per_chunk"]
         payload = [{"chunk_id": chunk.chunk_id, "text": chunk.text} for chunk in chunks]
         return (
             "Extract a knowledge graph independently for every input chunk. "
             "Never create relationships between different chunk_id values. "
             f"{schema}\n"
-            f"For each chunk, extract at most {KG_MAX_ENTITIES_PER_CHUNK} entities and "
-            f"{KG_MAX_RELATIONSHIPS_PER_CHUNK} relationships. Node properties must contain only "
+            f"For each chunk, extract at most {max_entities} entities and "
+            f"{max_relationships} relationships. Node properties must contain only "
             "the entity name. Relationship properties must be empty.\n"
             "Return only this JSON object, with exactly this structure:\n"
             + '{"chunks":[{"chunk_id":"input chunk ID","nodes":[{"id":"local ID","label":"type",'
@@ -518,8 +523,8 @@ class Neo4jGraphStore(BaseVectorStore):
     @staticmethod
     def _parse_kg_batch_response(
         content: str, chunks: list[AI4RAGChunk], on_error: str
-    ) -> list[tuple[AI4RAGChunk, Neo4jGraph]]:
-        """Validate a batched model result and retain only requested canonical chunks."""
+    ) -> tuple[list[tuple[AI4RAGChunk, Neo4jGraph]], list[AI4RAGChunk]]:
+        """Validate a batched result and return successful graphs plus chunks requiring retry."""
         chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
         try:
             result = json.loads(content)
@@ -548,10 +553,10 @@ class Neo4jGraphStore(BaseVectorStore):
                 continue
             seen_ids.add(chunk_id)
             graphs.append((chunk_by_id[chunk_id], graph))
-        missing_count = len(chunk_by_id) - len(seen_ids)
-        if missing_count:
-            logger.warning("KG batch LLM response omitted or invalidated %d requested chunks.", missing_count)
-        return graphs
+        missing = [chunk for chunk in chunks if chunk.chunk_id not in seen_ids]
+        if missing:
+            logger.warning("KG batch LLM response omitted or invalidated %d requested chunks.", len(missing))
+        return graphs, missing
 
     def _resolve_kg_entities(self) -> None:
         """Merge same-type, same-name entities exclusive to this collection."""

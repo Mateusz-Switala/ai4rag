@@ -57,75 +57,16 @@ _SCHEMA = Neo4jGraphSchema
 _CONSTRAINED_KG_ENTITIES = ("Person", "Organization", "Place", "Concept", "Event", "Product", "Technology")
 _CONSTRAINED_KG_RELATIONS = ("RELATED_TO", "PART_OF", "LOCATED_IN", "BELONGS_TO", "CREATED_BY", "MENTIONS")
 DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 1024
-# Entity extraction is generation-heavy. Two chunks per request keeps the
-# default workload below the MaaS gateway's practical capacity for one model
-# replica while still amortising request overhead.
+# Entity extraction is generation-heavy. Two chunks per request amortises
+# request overhead while retaining chunk-level provenance.
 DEFAULT_KG_EXTRACTION_BATCH_SIZE = 2
 KG_MAX_ENTITIES_PER_CHUNK = 6
 KG_MAX_RELATIONSHIPS_PER_CHUNK = 6
-KG_BATCH_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "knowledge_graph_batch",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "chunks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "chunk_id": {"type": "string"},
-                            "nodes": {
-                                "type": "array",
-                                "maxItems": KG_MAX_ENTITIES_PER_CHUNK,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "label": {"type": "string"},
-                                        "properties": {
-                                            "type": "object",
-                                            "properties": {"name": {"type": "string"}},
-                                            "required": ["name"],
-                                            "additionalProperties": False,
-                                        },
-                                    },
-                                    "required": ["id", "label", "properties"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                            "relationships": {
-                                "type": "array",
-                                "maxItems": KG_MAX_RELATIONSHIPS_PER_CHUNK,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "start_node_id": {"type": "string"},
-                                        "end_node_id": {"type": "string"},
-                                        "type": {"type": "string"},
-                                        "properties": {
-                                            "type": "object",
-                                            "properties": {},
-                                            "additionalProperties": False,
-                                        },
-                                    },
-                                    "required": ["start_node_id", "end_node_id", "type", "properties"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                        },
-                        "required": ["chunk_id", "nodes", "relationships"],
-                        "additionalProperties": False,
-                    },
-                }
-            },
-            "required": ["chunks"],
-            "additionalProperties": False,
-        },
-    },
-}
+# MaaS' OpenAI-compatible endpoint accepts JSON-object mode, but the deployed
+# Qwen model does not reliably honour strict JSON Schema mode. The detailed
+# prompt and local validation retain the application contract without repeatedly
+# retrying an unsupported response-format capability.
+KG_BATCH_RESPONSE_FORMAT = {"type": "json_object"}
 
 # GraphRAG's lexical nodes are temporary: _CanonicalKGWriter discards them in
 # favor of the canonical nodes already stored by add_documents. Keep their
