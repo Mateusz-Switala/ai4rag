@@ -57,7 +57,10 @@ _SCHEMA = Neo4jGraphSchema
 _CONSTRAINED_KG_ENTITIES = ("Person", "Organization", "Place", "Concept", "Event", "Product", "Technology")
 _CONSTRAINED_KG_RELATIONS = ("RELATED_TO", "PART_OF", "LOCATED_IN", "BELONGS_TO", "CREATED_BY", "MENTIONS")
 DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 1024
-DEFAULT_KG_EXTRACTION_BATCH_SIZE = 4
+# Entity extraction is generation-heavy. Two chunks per request keeps the
+# default workload below the MaaS gateway's practical capacity for one model
+# replica while still amortising request overhead.
+DEFAULT_KG_EXTRACTION_BATCH_SIZE = 2
 
 # GraphRAG's lexical nodes are temporary: _CanonicalKGWriter discards them in
 # favor of the canonical nodes already stored by add_documents. Keep their
@@ -202,13 +205,21 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         message_history=None,  # pylint: disable=unused-argument
         system_instruction: str | None = None,
     ):
+        return self._invoke(input, message_history, system_instruction, self._max_completion_tokens)
+
+    def _invoke(
+        self,
+        input: str,  # pylint: disable=redefined-builtin
+        message_history=None,  # pylint: disable=unused-argument
+        system_instruction: str | None = None,
+        max_completion_tokens: int | None = None,
+    ) -> LLMResponse:
+        """Make one request using the supplied completion limit."""
         messages: list[MessageTyped] = []
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": input})
-        kwargs = (
-            {"max_completion_tokens": self._max_completion_tokens} if self._max_completion_tokens is not None else {}
-        )
+        kwargs = {"max_completion_tokens": max_completion_tokens} if max_completion_tokens is not None else {}
         started_at = perf_counter()
         response = self._model.chat(messages, **kwargs)[0]
         with self._metrics_lock:
@@ -235,6 +246,19 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
     ):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.invoke, input, message_history, system_instruction)
+
+    async def ainvoke_with_completion_limit(
+        self, input: str, max_completion_tokens: int  # pylint: disable=redefined-builtin
+    ) -> LLMResponse:
+        """Invoke the model with a request-specific completion-token limit."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._invoke_with_completion_limit, input, max_completion_tokens)
+
+    def _invoke_with_completion_limit(
+        self, input: str, max_completion_tokens: int  # pylint: disable=redefined-builtin
+    ) -> LLMResponse:
+        """Invoke with a request-specific output limit while retaining adapter metrics."""
+        return self._invoke(input, max_completion_tokens=max_completion_tokens)
 
 
 # Keep malformed payloads untouched so GraphRAG can apply its configured error policy.
