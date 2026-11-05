@@ -5,6 +5,7 @@
 """Private adapters and helpers used by `ai4rag.rag.vector_store.neo4j`."""
 
 import asyncio
+import json
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -56,6 +57,7 @@ _SCHEMA = Neo4jGraphSchema
 _CONSTRAINED_KG_ENTITIES = ("Person", "Organization", "Place", "Concept", "Event", "Product", "Technology")
 _CONSTRAINED_KG_RELATIONS = ("RELATED_TO", "PART_OF", "LOCATED_IN", "BELONGS_TO", "CREATED_BY", "MENTIONS")
 DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 1024
+DEFAULT_KG_EXTRACTION_BATCH_SIZE = 4
 
 # GraphRAG's lexical nodes are temporary: _CanonicalKGWriter discards them in
 # favor of the canonical nodes already stored by add_documents. Keep their
@@ -85,7 +87,11 @@ def _collection_vector_index_name(collection_name: str) -> str:
 def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, Any]:
     """Validate KG extraction settings and apply the constrained default."""
     if config is None:
-        return {"mode": "constrained", "max_completion_tokens": DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS}
+        return {
+            "mode": "constrained",
+            "max_completion_tokens": DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS,
+            "batch_size": DEFAULT_KG_EXTRACTION_BATCH_SIZE,
+        }
     if not isinstance(config, dict):
         raise TypeError("kg_extraction_config must be a dictionary or None.")
 
@@ -99,8 +105,11 @@ def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, A
         or max_completion_tokens < 1
     ):
         raise ValueError("kg_extraction_config.max_completion_tokens must be a positive integer.")
+    batch_size = config.get("batch_size", DEFAULT_KG_EXTRACTION_BATCH_SIZE)
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("kg_extraction_config.batch_size must be a positive integer.")
     if mode == "constrained":
-        return {"mode": mode, "max_completion_tokens": max_completion_tokens}
+        return {"mode": mode, "max_completion_tokens": max_completion_tokens, "batch_size": batch_size}
 
     limits = {
         "max_entities_per_chunk": config.get("max_entities_per_chunk"),
@@ -109,7 +118,7 @@ def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, A
     for name, value in limits.items():
         if not isinstance(value, int) or value < 1:
             raise ValueError(f"kg_extraction_config.{name} must be a positive integer for free extraction.")
-    return {"mode": mode, "max_completion_tokens": max_completion_tokens, **limits}
+    return {"mode": mode, "max_completion_tokens": max_completion_tokens, "batch_size": batch_size, **limits}
 
 
 def _kg_pipeline_extraction_options(config: dict[str, Any]) -> dict[str, Any]:
@@ -174,9 +183,8 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
 
     ``SimpleKGPipeline`` calls ``ainvoke`` (async); we bridge the sync
     :meth:`BaseFoundationModel.chat` via ``run_in_executor``.  Response JSON
-    is normalised so that models returning a JSON *array* (``[{...}]``) are
-    converted to the expected object format (``{"nodes": [...], "relationships": [...]}``)
-    before the extractor parses the output.
+    is normalised for common, schema-compatible model variants before GraphRAG
+    parses it.
     """
 
     def __init__(self, model: BaseFoundationModel, max_completion_tokens: int | None = None) -> None:
@@ -185,6 +193,7 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         self._max_completion_tokens = max_completion_tokens
         self._calls = 0
         self._elapsed_seconds = 0.0
+        self._format_repairs = 0
         self._metrics_lock = Lock()
 
     def invoke(
@@ -206,13 +215,17 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
             self._calls += 1
             self._elapsed_seconds += perf_counter() - started_at
         content = (response["content"] if isinstance(response, Mapping) else response.message.content) or ""
-        return LLMResponse(content=content)
+        normalised_content = _normalise_kg_response(content)
+        if normalised_content != content:
+            with self._metrics_lock:
+                self._format_repairs += 1
+        return LLMResponse(content=normalised_content)
 
     @property
-    def metrics(self) -> tuple[int, float]:
-        """Return model calls and their cumulative duration."""
+    def metrics(self) -> tuple[int, float, int]:
+        """Return model calls, cumulative duration, and repaired response count."""
         with self._metrics_lock:
-            return self._calls, self._elapsed_seconds
+            return self._calls, self._elapsed_seconds, self._format_repairs
 
     async def ainvoke(
         self,
@@ -222,6 +235,50 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
     ):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.invoke, input, message_history, system_instruction)
+
+
+# Keep malformed payloads untouched so GraphRAG can apply its configured error policy.
+# pylint: disable-next=too-many-return-statements
+def _normalise_kg_response(content: str) -> str:
+    """Convert common schema-compatible KG response variants to GraphRAG's JSON object.
+
+    The extractor expects an object containing ``nodes`` and ``relationships``.
+    Some OpenAI-compatible models instead return a fenced object, a singleton
+    list containing that object, or use ``entities``/``relations`` aliases.
+    Keep unparseable content unchanged so GraphRAG retains its normal error
+    policy, and never log model output because it contains source content.
+    """
+    stripped = content.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        stripped = stripped.split("\n", maxsplit=1)[-1].rsplit("```", maxsplit=1)[0].strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return content
+
+    if isinstance(parsed, list):
+        if len(parsed) == 1 and isinstance(parsed[0], dict):
+            parsed = parsed[0]
+        else:
+            parsed = {"nodes": parsed, "relationships": []}
+    if not isinstance(parsed, dict):
+        return content
+    if "chunks" in parsed:
+        if isinstance(parsed["chunks"], list):
+            return (
+                content
+                if content == stripped and set(parsed) == {"chunks"}
+                else json.dumps({"chunks": parsed["chunks"]})
+            )
+        return content
+
+    nodes = parsed.get("nodes", parsed.get("entities", []))
+    relationships = parsed.get("relationships", parsed.get("relations", []))
+    if not isinstance(nodes, list) or not isinstance(relationships, list):
+        return content
+    if content == stripped and set(parsed) == {"nodes", "relationships"}:
+        return content
+    return json.dumps({"nodes": nodes, "relationships": relationships})
 
 
 class _CollectionKGWriter(Neo4jWriter):
@@ -283,6 +340,7 @@ class _CollectionKGWriter(Neo4jWriter):
         # two disconnected patterns in one MATCH, which emits a Cartesian
         # product warning even though both endpoints are keyed by one row.
         # Keeping `row` between clauses preserves its one-to-one association.
+        subquery_open = "CALL (rel, row) {" if self.is_version_5_23_or_above else "CALL {"
         query = (
             "UNWIND $rows AS row "
             "MATCH (start:__KGBuilder__ {__tmp_internal_id: row.start_node_id}) "
@@ -291,7 +349,7 @@ class _CollectionKGWriter(Neo4jWriter):
             "WITH start, end, row "
             "CALL apoc.merge.relationship(start, row.type, {}, row.properties, end, row.properties) YIELD rel "
             "WITH rel, row "
-            "CALL { WITH rel, row "
+            f"{subquery_open} WITH rel, row "
             "WITH rel, row WHERE row.embedding_properties IS NOT NULL "
             "UNWIND keys(row.embedding_properties) AS emb "
             "CALL db.create.setRelationshipVectorProperty(rel, emb, row.embedding_properties[emb]) } "
