@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -13,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import neo4j
 import pytest
 from neo4j_graphrag.components.types import Neo4jGraph, Neo4jNode, Neo4jRelationship
+from neo4j_graphrag.llm.base import LLMInterfaceV2
 
 from ai4rag.rag.chunking.chunk import AI4RAGChunk
 from ai4rag.rag.vector_store.config import Neo4jConfig
@@ -90,9 +92,11 @@ def test_llm_adapter_accepts_base_foundation_model_message_response():
     model = MagicMock(model_id="test-model")
     model.chat.return_value = [{"role": "assistant", "content": '{"nodes": [], "relationships": []}'}]
 
-    response = _LLMAdapter(model).invoke("Extract entities.")
+    adapter = _LLMAdapter(model)
+    response = adapter.invoke([{"role": "user", "content": "Extract entities."}])
 
     assert response.content == '{"nodes": [], "relationships": []}'
+    assert isinstance(adapter, LLMInterfaceV2)
     model.chat.assert_called_once_with([{"role": "user", "content": "Extract entities."}])
 
 
@@ -101,7 +105,7 @@ def test_llm_adapter_can_override_the_completion_limit_for_entity_extraction():
     model = MagicMock(model_id="test-model")
     model.chat.return_value = [{"role": "assistant", "content": '{"nodes": [], "relationships": []}'}]
 
-    _LLMAdapter(model, max_completion_tokens=1024).invoke("Extract entities.")
+    _LLMAdapter(model, max_completion_tokens=1024).invoke([{"role": "user", "content": "Extract entities."}])
 
     model.chat.assert_called_once_with([{"role": "user", "content": "Extract entities."}], max_completion_tokens=1024)
 
@@ -111,7 +115,9 @@ def test_llm_adapter_requests_a_json_object_response():
     model = MagicMock(model_id="test-model")
     model.chat.return_value = [{"role": "assistant", "content": '{"chunks": []}'}]
 
-    _LLMAdapter(model, response_format=KG_BATCH_RESPONSE_FORMAT).invoke("Extract entities.")
+    _LLMAdapter(model, response_format=KG_BATCH_RESPONSE_FORMAT).invoke(
+        [{"role": "user", "content": "Extract entities."}]
+    )
 
     model.chat.assert_called_once_with(
         [{"role": "user", "content": "Extract entities."}], response_format=KG_BATCH_RESPONSE_FORMAT
@@ -128,7 +134,7 @@ def test_llm_adapter_repairs_fenced_singleton_kg_response():
     ]
     adapter = _LLMAdapter(model)
 
-    response = adapter.invoke("Extract entities.")
+    response = adapter.invoke([{"role": "user", "content": "Extract entities."}])
 
     assert json.loads(response.content) == {"nodes": [], "relationships": []}
     assert adapter.metrics[2] == 1
@@ -742,6 +748,20 @@ def _make_retriever_item(text, score=0.9, meta=None):
 
 @patch("ai4rag.rag.vector_store.neo4j.neo4j.GraphDatabase.driver")
 class TestSearchGraph:
+    def test_waits_for_vector_index_once_across_concurrent_searches(
+        self, mock_driver_cls, mock_embedding, neo4j_config
+    ):
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        session = mock_driver_cls.return_value.session.return_value.__enter__.return_value
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            list(executor.map(lambda _: store._ensure_kg_schema(wait_until_online=True), range(10)))
+
+        create_calls = [call for call in session.run.call_args_list if "CREATE VECTOR INDEX" in call.args[0]]
+        wait_calls = [call for call in session.run.call_args_list if "CALL db.awaitIndex" in call.args[0]]
+        assert len(create_calls) == 1
+        assert len(wait_calls) == 1
+
     def test_uses_cypher_retriever_with_collection_index(self, mock_driver_cls, mock_embedding, neo4j_config):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
 

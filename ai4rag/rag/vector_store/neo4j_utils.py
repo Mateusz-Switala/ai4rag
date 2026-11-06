@@ -19,12 +19,13 @@ from neo4j_graphrag.components.text_splitters.base import TextSplitter
 from neo4j_graphrag.components.types import LexicalGraphConfig, Neo4jGraph, Neo4jRelationship, TextChunk, TextChunks
 from neo4j_graphrag.embeddings.base import Embedder as _NeoEmbedder
 from neo4j_graphrag.generation.prompts import ERExtractionTemplate
-from neo4j_graphrag.llm.base import LLMInterface as _NeoLLMInterface
+from neo4j_graphrag.llm.base import LLMInterfaceV2 as _NeoLLMInterface
 from neo4j_graphrag.llm.types import LLMResponse
 from neo4j_graphrag.neo4j_queries import db_cleaning_query
+from neo4j_graphrag.types import LLMMessage
 
 from ai4rag.rag.embedding.base_model import BaseEmbeddingModel
-from ai4rag.rag.foundation_models.base_model import BaseFoundationModel, MessageTyped
+from ai4rag.rag.foundation_models.base_model import BaseFoundationModel
 from ai4rag.rag.vector_store.utils import validate_search_params
 
 
@@ -184,16 +185,12 @@ class _EmbedderAdapter(_NeoEmbedder):  # type: ignore[misc]
             return self._model_calls, self._cache_hits, self._elapsed_seconds
 
 
-# GraphRAG's tool-call defaults intentionally raise NotImplementedError.
-# This KG adapter uses ainvoke and does not support tool calling.
-# pylint: disable-next=abstract-method
 class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
     """Wraps :class:`BaseFoundationModel` to satisfy ``neo4j_graphrag``'s LLM interface.
 
-    ``SimpleKGPipeline`` calls ``ainvoke`` (async); we bridge the sync
-    :meth:`BaseFoundationModel.chat` via ``run_in_executor``.  Response JSON
-    is normalised for common, schema-compatible model variants before GraphRAG
-    parses it.
+    Implements GraphRAG's V2 list-of-messages contract and bridges the sync
+    :meth:`BaseFoundationModel.chat` via a worker thread. Response JSON is
+    normalised for common, schema-compatible model variants before parsing.
     """
 
     def __init__(
@@ -213,29 +210,35 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
 
     def invoke(
         self,
-        input: str,  # pylint: disable=redefined-builtin
-        message_history=None,  # pylint: disable=unused-argument
-        system_instruction: str | None = None,
-    ):
-        return self._invoke(input, message_history, system_instruction, self._max_completion_tokens)
+        input: list[LLMMessage],  # pylint: disable=redefined-builtin
+        *,
+        response_format: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Invoke the wrapped model using GraphRAG V2's message contract."""
+        return self._invoke(
+            input,
+            max_completion_tokens=kwargs.pop("max_completion_tokens", self._max_completion_tokens),
+            response_format=response_format,
+            **kwargs,
+        )
 
     def _invoke(
         self,
-        input: str,  # pylint: disable=redefined-builtin
-        message_history=None,  # pylint: disable=unused-argument
-        system_instruction: str | None = None,
+        input: list[LLMMessage],  # pylint: disable=redefined-builtin
         max_completion_tokens: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """Make one request using the supplied completion limit."""
-        messages: list[MessageTyped] = []
-        if system_instruction:
-            messages.append({"role": "system", "content": system_instruction})
-        messages.append({"role": "user", "content": input})
-        kwargs = {"max_completion_tokens": max_completion_tokens} if max_completion_tokens is not None else {}
-        if self._response_format is not None:
-            kwargs["response_format"] = self._response_format
+        model_kwargs = dict(kwargs)
+        if max_completion_tokens is not None:
+            model_kwargs["max_completion_tokens"] = max_completion_tokens
+        effective_response_format = response_format if response_format is not None else self._response_format
+        if effective_response_format is not None:
+            model_kwargs["response_format"] = effective_response_format
         started_at = perf_counter()
-        response = self._model.chat(messages, **kwargs)[0]
+        response = self._model.chat(input, **model_kwargs)[0]
         with self._metrics_lock:
             self._calls += 1
             self._elapsed_seconds += perf_counter() - started_at
@@ -254,12 +257,13 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
 
     async def ainvoke(
         self,
-        input: str,  # pylint: disable=redefined-builtin
-        message_history=None,
-        system_instruction: str | None = None,
-    ):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.invoke, input, message_history, system_instruction)
+        input: list[LLMMessage],  # pylint: disable=redefined-builtin
+        *,
+        response_format: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Asynchronously invoke the wrapped model using GraphRAG V2's contract."""
+        return await asyncio.to_thread(self.invoke, input, response_format=response_format, **kwargs)
 
     async def ainvoke_with_completion_limit(
         self, input: str, max_completion_tokens: int  # pylint: disable=redefined-builtin
@@ -272,7 +276,7 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         self, input: str, max_completion_tokens: int  # pylint: disable=redefined-builtin
     ) -> LLMResponse:
         """Invoke with a request-specific output limit while retaining adapter metrics."""
-        return self._invoke(input, max_completion_tokens=max_completion_tokens)
+        return self._invoke([{"role": "user", "content": input}], max_completion_tokens=max_completion_tokens)
 
 
 # Keep malformed payloads untouched so GraphRAG can apply its configured error policy.

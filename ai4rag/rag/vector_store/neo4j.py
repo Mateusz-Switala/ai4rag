@@ -12,6 +12,7 @@ from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
+from threading import Lock
 from time import perf_counter
 from typing import Any
 
@@ -209,33 +210,46 @@ class Neo4jGraphStore(BaseVectorStore):
         driver_uri = _normalize_custom_ca_uri(config.uri) if config.ca_cert else config.uri
         self._driver = neo4j.GraphDatabase.driver(driver_uri, **driver_kwargs)
         self._driver.verify_connectivity()
+        self._vector_index_lock = Lock()
+        self._vector_index_online = False
 
     def _ensure_kg_schema(self, *, wait_until_online: bool = False) -> None:
-        """Create this collection's vector index, optionally waiting for it to become queryable."""
-        started_at = perf_counter()
-        index_name = _collection_vector_index_name(self._collection_name)
-        with self._driver.session(database=self._config.database) as session:
-            session.run(
-                f"CREATE VECTOR INDEX `{index_name}` IF NOT EXISTS "
-                # Neo4j vector indexes support one node label. The collection
-                # label scopes this index; nodes retain their :Chunk label for
-                # graph traversal queries.
-                f"FOR (n:`{self._collection_name}`) ON (n.{_SCHEMA.EMBEDDING}) "
-                f"OPTIONS {{indexConfig: {{`vector.dimensions`: $dim, `vector.similarity_function`: 'cosine'}}}}",
-                dim=self._embedding_dimension,
-            )
-            if wait_until_online:
+        """Create this collection's vector index, optionally waiting for it to become queryable.
+
+        Graph retrieval can call this method from every inference worker.  Once
+        this store has observed the index ONLINE, neither the DDL request nor
+        the wait needs to be repeated; a lock also prevents concurrent workers
+        from issuing duplicate first-use requests.
+        """
+        with self._vector_index_lock:
+            if wait_until_online and self._vector_index_online:
+                return
+
+            started_at = perf_counter()
+            index_name = _collection_vector_index_name(self._collection_name)
+            with self._driver.session(database=self._config.database) as session:
                 session.run(
-                    "CALL db.awaitIndex($index_name, $timeout_seconds)",
-                    index_name=index_name,
-                    timeout_seconds=self._VECTOR_INDEX_WAIT_SECONDS,
-                ).consume()
-        logger.info(
-            "Neo4j vector index %s for collection=%s completed in %.2fs.",
-            "online wait" if wait_until_online else "creation request",
-            self._collection_name,
-            perf_counter() - started_at,
-        )
+                    f"CREATE VECTOR INDEX `{index_name}` IF NOT EXISTS "
+                    # Neo4j vector indexes support one node label. The collection
+                    # label scopes this index; nodes retain their :Chunk label for
+                    # graph traversal queries.
+                    f"FOR (n:`{self._collection_name}`) ON (n.{_SCHEMA.EMBEDDING}) "
+                    f"OPTIONS {{indexConfig: {{`vector.dimensions`: $dim, `vector.similarity_function`: 'cosine'}}}}",
+                    dim=self._embedding_dimension,
+                )
+                if wait_until_online:
+                    session.run(
+                        "CALL db.awaitIndex($index_name, $timeout_seconds)",
+                        index_name=index_name,
+                        timeout_seconds=self._VECTOR_INDEX_WAIT_SECONDS,
+                    ).consume()
+                    self._vector_index_online = True
+            logger.info(
+                "Neo4j vector index %s for collection=%s completed in %.2fs.",
+                "online wait" if wait_until_online else "creation request",
+                self._collection_name,
+                perf_counter() - started_at,
+            )
 
     # Pylint counts loop and comprehension targets below as locals. They are
     # intentionally kept together to make the write batching transaction-safe.
