@@ -394,6 +394,8 @@ class Neo4jConfig(BaseVectorStoreConfig):
     password: str = field(default="", repr=False)
     database: str = "neo4j"
     ca_cert: str | None = field(default=None, repr=False)
+    liveness_check_timeout: float = 30.0
+    max_connection_lifetime: float = 300.0
     provider: str = "neo4j"
 
     def __post_init__(self) -> None:
@@ -406,6 +408,12 @@ class Neo4jConfig(BaseVectorStoreConfig):
         Without a custom CA, only ``+s`` URIs are accepted for remote hosts.
         """
         scheme = urlsplit(self.uri).scheme.lower()
+        for name, value in {
+            "liveness_check_timeout": self.liveness_check_timeout,
+            "max_connection_lifetime": self.max_connection_lifetime,
+        }.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"Neo4jConfig.{name} must be a positive number.")
         if self.ca_cert:
             if scheme not in {"neo4j", "bolt", "neo4j+s", "bolt+s"}:
                 raise ValueError(
@@ -441,6 +449,8 @@ class Neo4jConfig(BaseVectorStoreConfig):
             password=os.environ["NEO4J_PASSWORD"],
             database=os.environ.get("NEO4J_DATABASE", "neo4j"),
             ca_cert=os.environ.get("NEO4J_CA_CERT"),
+            liveness_check_timeout=float(os.environ.get("NEO4J_LIVENESS_CHECK_TIMEOUT", "30")),
+            max_connection_lifetime=float(os.environ.get("NEO4J_MAX_CONNECTION_LIFETIME", "300")),
         )
 
 

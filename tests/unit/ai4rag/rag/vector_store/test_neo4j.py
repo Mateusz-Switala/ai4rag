@@ -140,6 +140,19 @@ def test_llm_adapter_repairs_fenced_singleton_kg_response():
     assert adapter.metrics[2] == 1
 
 
+def test_llm_adapter_repairs_a_valid_json_object_with_a_short_preamble():
+    """Cheap local repair must recover valid JSON without a second MaaS call."""
+    model = MagicMock(model_id="test-model")
+    model.chat.return_value = [{"role": "assistant", "content": 'Result: {"chunks": []}'}]
+
+    response = _LLMAdapter(model, response_format=KG_BATCH_RESPONSE_FORMAT).invoke(
+        [{"role": "user", "content": "Extract entities."}]
+    )
+
+    assert json.loads(response.content) == {"chunks": []}
+    assert model.chat.call_count == 1
+
+
 def test_kg_embedder_reuses_canonical_embedding(mock_embedding):
     adapter = _EmbedderAdapter(mock_embedding, {"canonical chunk": [0.9, 0.8]})
 
@@ -378,7 +391,11 @@ class TestNeo4jGraphStoreInit:
 
         assert config.ca_cert is None
         assert mock_driver_cls.call_args.args[0] == "neo4j+s://host:7687"
-        assert mock_driver_cls.call_args.kwargs == {"auth": ("neo4j", "test")}
+        assert mock_driver_cls.call_args.kwargs == {
+            "auth": ("neo4j", "test"),
+            "liveness_check_timeout": 30.0,
+            "max_connection_lifetime": 300.0,
+        }
 
     @pytest.mark.parametrize(
         ("configured_uri", "expected_driver_uri"),
@@ -507,16 +524,31 @@ class TestAddDocuments:
         session = mock_driver_cls.return_value.session.return_value.__enter__.return_value
         store.add_documents([chunk], model=MagicMock())
         assert not any("SET kc:ai4rag_col" in call.args[0] for call in session.run.call_args_list)
-        resolution_call = next(
-            call for call in session.run.call_args_list if "apoc.refactor.mergeNodes" in call.args[0]
-        )
-        resolution_query = resolution_call.args[0]
-        assert "MATCH (entity:__Entity__)-[:FROM_CHUNK]->(:`ai4rag_col`:Chunk)" in resolution_query
-        assert "WHERE entity.ai4rag_kg_collections = [$col]" in resolution_query
-        assert "WITH entity_label, entity.name AS name" in resolution_query
-        assert "mergeRels: false" in resolution_query
-        assert "SET node.ai4rag_kg_collections = reduce(" in resolution_query
-        assert resolution_call.kwargs["col"] == "ai4rag_col"
+        assert not any("apoc.refactor.mergeNodes" in call.args[0] for call in session.run.call_args_list)
+        constraint_queries = [call.args[0] for call in session.run.call_args_list]
+        assert any("ai4rag_entity_identity" in query for query in constraint_queries)
+
+    def test_kg_prompt_includes_synthetic_format_examples(self, mock_driver_cls, mock_embedding, neo4j_config):
+        """Few-shot examples specify both populated and empty chunk output."""
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+
+        prompt = store._build_kg_batch_prompt(self._make_chunks(1))
+
+        assert "Examples (format only; do not copy their facts or IDs):" in prompt
+        assert '"chunk_id":"example-relationship"' in prompt
+        assert '"chunk_id":"example-empty","nodes":[],"relationships":[]' in prompt
+
+    def test_creates_composite_canonical_lookup_constraints(self, mock_driver_cls, mock_embedding, neo4j_config):
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        session = mock_driver_cls.return_value.session.return_value.__enter__.return_value
+
+        store._ensure_canonical_schema()
+        store._ensure_canonical_schema()
+
+        queries = [call.args[0] for call in session.run.call_args_list]
+        assert queries.count(next(query for query in queries if "ai4rag_chunk_collection_id" in query)) == 1
+        assert "REQUIRE (c.collection, c.id) IS UNIQUE" in " ".join(queries)
+        assert "REQUIRE (d.collection, d.id) IS UNIQUE" in " ".join(queries)
 
     def test_kg_pipeline_prompt_preserves_canonical_chunk_text(self, mock_driver_cls, mock_embedding, neo4j_config):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
@@ -634,10 +666,10 @@ class TestAddDocuments:
         assert completion_limits == [1024, 1024, 1024, 1024, 1024]
         assert sleep.await_args_list == [call(1), call(2)]
 
-    def test_kg_pipeline_retries_then_splits_an_improper_batch_response(
+    def test_kg_pipeline_immediately_splits_an_improper_batch_response(
         self, mock_driver_cls, mock_embedding, neo4j_config
     ):
-        """Malformed output retries once before bounded singleton fallback."""
+        """Malformed multi-chunk output is isolated without repeating the batch."""
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
         completion_limits: list[int] = []
 
@@ -657,8 +689,8 @@ class TestAddDocuments:
         ):
             store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
 
-        assert completion_limits == [1024, 1024, 1024, 1024]
-        sleep.assert_awaited_once_with(1)
+        assert completion_limits == [1024, 1024, 1024]
+        sleep.assert_not_awaited()
 
     def test_kg_pipeline_retries_only_chunks_omitted_from_a_valid_batch(
         self, mock_driver_cls, mock_embedding, neo4j_config
@@ -702,6 +734,7 @@ class TestAddDocuments:
             store._run_kg_pipeline([self._make_chunks(1)[0]], MagicMock(), perform_entity_resolution=False)
 
         assert "Skipping KG extraction" in caplog.text
+        assert store.is_kg_extraction_degraded
 
     def test_pipeline_can_skip_scoped_entity_resolution(self, mock_driver_cls, mock_embedding, neo4j_config):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
@@ -1019,21 +1052,21 @@ def test_canonical_writer_skips_pipeline_document_and_chunk_nodes(serialized):
     result = asyncio.run(writer.run(graph.model_dump() if serialized else graph))
 
     assert result.status == "SUCCESS"
-    calls = driver.execute_query.call_args_list
-    node_rows = next(call.kwargs["parameters_"]["rows"] for call in calls if "CREATE (n:__KGBuilder__" in call.args[0])
-    relation_rows = next(
-        call.kwargs["parameters_"]["rows"] for call in calls if "apoc.merge.relationship" in call.args[0]
-    )
-    link_call = next(call for call in calls if "MERGE (e)-[:FROM_CHUNK]->(c)" in call.args[0])
-    assert {row["label"] for row in node_rows} == {"Person", "Organization"}
+    session = driver.session.return_value.__enter__.return_value
+    executed = session.execute_write.call_args_list
+    node_rows = executed[0].args[1]
+    relation_rows = executed[1].args[1]
+    link_rows = executed[2].args[1]
+    assert {row["labels"][0] for row in node_rows} == {"Person", "Organization"}
     assert [row["type"] for row in relation_rows] == ["WORKS_AT"]
-    assert link_call.kwargs["parameters_"] == {
-        "entity_ids": ["acme", "alice"],
-        "chunk_id": "canonical_c1",
-        "col": "ai4rag_col",
-    }
-    assert all(call.kwargs["database_"] == "tenant_graph" for call in calls)
-    driver.session.assert_called_once_with(database="tenant_graph")
+    assert {row["chunk_id"] for row in link_rows} == {"canonical_c1"}
+    assert all(call.args[2] == "ai4rag_col" for call in executed)
+    assert driver.session.call_count == 3
+    entity_tx = MagicMock()
+    executed[0].args[0](entity_tx, *executed[0].args[1:])
+    entity_query = entity_tx.run.call_args.args[0]
+    assert "apoc.merge.node" in entity_query
+    assert "ai4rag_entity_key" in entity_query
 
 
 def test_canonical_writer_keeps_entities_named_document_and_chunk():
@@ -1068,23 +1101,13 @@ def test_canonical_writer_keeps_entities_named_document_and_chunk():
 
     assert result.status == "SUCCESS"
     mock_logger.info.assert_not_called()
-    node_rows = next(
-        call.kwargs["parameters_"]["rows"]
-        for call in driver.execute_query.call_args_list
-        if "CREATE (n:__KGBuilder__" in call.args[0]
-    )
-    assert {row["label"] for row in node_rows} == {"Document", "Chunk"}
+    executed = driver.session.return_value.__enter__.return_value.execute_write.call_args_list
+    node_rows = executed[0].args[1]
+    assert {row["labels"][0] for row in node_rows} == {"Document", "Chunk"}
     assert all("__Entity__" in row["labels"] for row in node_rows)
-    relationship_rows = next(
-        call.kwargs["parameters_"]["rows"]
-        for call in driver.execute_query.call_args_list
-        if "apoc.merge.relationship" in call.args[0]
-    )
+    relationship_rows = executed[1].args[1]
     assert [row["type"] for row in relationship_rows] == ["CONTAINS"]
-    link_call = next(
-        call for call in driver.execute_query.call_args_list if "MERGE (e)-[:FROM_CHUNK]->(c)" in call.args[0]
-    )
-    assert link_call.kwargs["parameters_"]["entity_ids"] == ["semantic_chunk", "semantic_doc"]
+    assert len(executed[2].args[1]) == 2
 
 
 def test_canonical_writer_rejects_multiple_source_documents_without_logging_entities():
@@ -1131,11 +1154,8 @@ def test_canonical_writer_uses_bound_chunk_id_without_lexical_graph():
         result = asyncio.run(writer.run(graph))
 
     assert result.status == "SUCCESS"
-    link_call = next(
-        call for call in driver.execute_query.call_args_list if "MERGE (e)-[:FROM_CHUNK]->(c)" in call.args[0]
-    )
-    assert link_call.kwargs["parameters_"]["entity_ids"] == ["alice"]
-    assert link_call.kwargs["parameters_"]["chunk_id"] == "canonical_c1"
+    executed = driver.session.return_value.__enter__.return_value.execute_write.call_args_list
+    assert executed[-1].args[1][0]["chunk_id"] == "canonical_c1"
     assert writer._chunk_id.get() is None
 
 
