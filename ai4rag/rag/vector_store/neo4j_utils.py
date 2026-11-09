@@ -60,7 +60,7 @@ _SCHEMA = Neo4jGraphSchema
 
 _CONSTRAINED_KG_ENTITIES = ("Person", "Organization", "Place", "Concept", "Event", "Product", "Technology")
 _CONSTRAINED_KG_RELATIONS = ("RELATED_TO", "PART_OF", "LOCATED_IN", "BELONGS_TO", "CREATED_BY", "MENTIONS")
-DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 1024
+DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 2048
 # Entity extraction is generation-heavy. Two chunks per request amortises
 # request overhead while retaining chunk-level provenance.
 DEFAULT_KG_EXTRACTION_BATCH_SIZE = 2
@@ -293,9 +293,7 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
             self._calls += 1
             self._elapsed_seconds += perf_counter() - started_at
         stop_reason = (
-            response.get("finish_reason")
-            if isinstance(response, Mapping)
-            else getattr(response, "finish_reason", None)
+            response.get("finish_reason") if isinstance(response, Mapping) else getattr(response, "finish_reason", None)
         )
         logger.info(
             "KG extraction LLM response received (model=%s, stop_reason=%s).",
@@ -340,7 +338,7 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
 
 
 # Keep malformed payloads untouched so GraphRAG can apply its configured error policy.
-# pylint: disable-next=too-many-return-statements
+# pylint: disable-next=too-many-return-statements,too-many-branches
 def _normalise_kg_response(content: str) -> str:
     """Convert common schema-compatible KG response variants to GraphRAG's JSON object.
 
