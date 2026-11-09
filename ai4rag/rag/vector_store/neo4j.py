@@ -440,6 +440,7 @@ class Neo4jGraphStore(BaseVectorStore):
             max_concurrent,
             self._collection_name,
         )
+        pipeline_started_at = perf_counter()
 
         kg_writer = _CanonicalKGWriter(self._driver, self._config.database, self._collection_name)
         response_format = (
@@ -597,6 +598,11 @@ class Neo4jGraphStore(BaseVectorStore):
             llm_elapsed_seconds,
             llm_format_repairs,
             kg_writer.write_elapsed_seconds,
+        )
+        logger.info(
+            "KG extraction and batched graph persistence completed in %.2fs (collection=%s).",
+            perf_counter() - pipeline_started_at,
+            self._collection_name,
         )
 
         logger.info(
