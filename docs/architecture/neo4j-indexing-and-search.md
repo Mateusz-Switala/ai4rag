@@ -97,8 +97,9 @@ Callers can override `chunking_methods`, `chunk_sizes`, and `chunk_overlaps` whe
 `add_documents()` runs batched KG extraction on non-empty chunk text when a foundation model was supplied at store construction or as `model=` to `add_documents()`.
 Without a model, it stores only canonical chunks.
 The extractor preserves the existing canonical text and chunk ID; it does not split recursive or hybrid chunks again. It batches two chunks per MaaS request by default, asks for JSON-object output, and validates each returned chunk graph locally. During extraction, ai4rag suppresses GraphRAG's verbose logs that include document text, retains warnings/errors, and logs extraction start and completion with chunk counts.
-The default request concurrency is two. Pass `kg_max_concurrent` to `Neo4jGraphStore.add_documents()` or `AI4RAGExperiment` to tune it for the foundation-model endpoint. Retry backoff does not occupy a concurrency slot; malformed batches retry only their failed chunks and then use bounded singleton fallback.
-ai4rag disables GraphRAG's database-wide resolver and optionally resolves entities for this collection after all chunk extraction finishes (enabled by default).
+The default request concurrency is two. Pass `kg_max_concurrent` to `Neo4jGraphStore.add_documents()` or `AI4RAGExperiment` to tune it for the foundation-model endpoint. Retry backoff does not occupy a concurrency slot. A malformed multi-chunk response is immediately isolated into bounded singleton requests; valid responses retry only their omitted chunks. The parser locally removes fences and a short preamble only when it can recover an already-valid JSON object, and never invents graph data.
+`kg_extraction_config.response_format` defaults to `json_object`; set it to `json_schema` only for a MaaS model deployment verified to enforce JSON Schema. `max_skipped_chunks` defaults to zero. Exceeding it marks extraction degraded, or raises when `partial_failure_policy` is `raise`.
+ai4rag resolves named entity identity during bounded, collection-scoped ingestion writes, rather than running a database-wide post-extraction resolver.
 Each chunk is therefore one KG extraction input; an upstream chunk that is too large for the foundation model can exceed its context limit.
 
 | Extraction mode | Behavior |
@@ -117,10 +118,8 @@ These are distinct from model-extracted entity types such as `Document` or `Chun
 ai4rag's canonical graph writer stores only the extracted entities and their relationships.
 It connects each entity to the existing canonical chunk by its chunk ID.
 No second source document or chunk node is persisted, and linking does not depend on matching text.
-The writer records ownership on the relationships it writes; entity ownership is tagged before resolution.
-The scoped resolver merges same-name entities of the same type only when they link to canonical chunks in this collection and are owned exclusively by this collection.
-It leaves shared entities untouched and retains separate relationship edges so their ownership tags are not discarded.
-When collections resolve the same entity pair, an existing edge from another collection must not become part of this collection's search path.
+The writer records ownership on the relationships it writes; entity ownership is tagged during the same ingestion write.
+During ingestion, same-name entities of the same type are merged through a collection-scoped, normalized identity key. Entities without a name remain local to their source chunk to avoid unsafe merges. This avoids a graph-wide post-ingestion APOC merge pass while preserving collection isolation. Relationship ownership tags ensure an edge from another collection does not become part of this collection's search path.
 
 The public indexing paths are:
 

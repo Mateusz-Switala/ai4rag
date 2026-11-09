@@ -37,6 +37,7 @@ from ai4rag.rag.vector_store.neo4j_utils import (
     Neo4jGraphSchema,
     _build_graph_retrieval_query,
     _CanonicalKGWriter,
+    KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT,
     _collection_vector_index_name,
     _EmbedderAdapter,
     _LLMAdapter,
@@ -93,6 +94,14 @@ _KG_EXTRACTION_BACKOFF_JITTER_SECONDS = 0.25
 
 class _KGResponseFormatError(ValueError):
     """An LLM response could not be decoded as the requested KG batch schema."""
+
+    def __init__(self, message: str, *, malformed_batch: bool = False) -> None:
+        super().__init__(message)
+        self.malformed_batch = malformed_batch
+
+
+class _KGExtractionDegradedError(RuntimeError):
+    """KG extraction exceeded the caller's tolerated partial-failure budget."""
 
 
 def _is_retryable_kg_extraction_error(error: Exception) -> bool:
@@ -197,7 +206,11 @@ class Neo4jGraphStore(BaseVectorStore):
         self._embedding_dimension = resolve_embedding_dimension(embedding_model)
         self._foundation_model = foundation_model
         self._kg_extraction_config = _validate_kg_extraction_config(kg_extraction_config)
-        driver_kwargs: dict[str, Any] = {"auth": (config.username, config.password)}
+        driver_kwargs: dict[str, Any] = {
+            "auth": (config.username, config.password),
+            "liveness_check_timeout": config.liveness_check_timeout,
+            "max_connection_lifetime": config.max_connection_lifetime,
+        }
         if config.ca_cert:
             # The Neo4j driver rejects ``trusted_certificates`` with ``+s``
             # URIs because those schemes select its built-in CA trust mode.
@@ -212,6 +225,53 @@ class Neo4jGraphStore(BaseVectorStore):
         self._driver.verify_connectivity()
         self._vector_index_lock = Lock()
         self._vector_index_online = False
+        self._canonical_schema_ready = False
+        self._canonical_schema_lock = Lock()
+        self._kg_extraction_degraded = False
+
+    @property
+    def is_kg_extraction_degraded(self) -> bool:
+        """Whether the latest KG extraction exceeded its skipped-chunk budget."""
+        return self._kg_extraction_degraded
+
+    def _ensure_canonical_schema(self) -> None:
+        """Create lookup constraints used by bounded canonical and KG writes."""
+        with self._canonical_schema_lock:
+            if self._canonical_schema_ready:
+                return
+            started_at = perf_counter()
+            with self._driver.session(database=self._config.database) as session:
+                # Collections written by earlier ai4rag versions did not put
+                # collection on Document nodes. Backfill before adding the
+                # composite constraints, so re-indexing remains idempotent.
+                session.run(
+                    f"MATCH (d:`{self._collection_name}`:{_SCHEMA.DOCUMENT_LABEL}) "
+                    f"WHERE d.{_SCHEMA.COLLECTION} IS NULL SET d.{_SCHEMA.COLLECTION} = $col",
+                    col=self._collection_name,
+                ).consume()
+                session.run(
+                    f"MATCH (c:`{self._collection_name}`:{_SCHEMA.CHUNK_LABEL}) "
+                    f"WHERE c.{_SCHEMA.COLLECTION} IS NULL SET c.{_SCHEMA.COLLECTION} = $col",
+                    col=self._collection_name,
+                ).consume()
+                session.run(
+                    "CREATE CONSTRAINT ai4rag_chunk_collection_id IF NOT EXISTS "
+                    "FOR (c:Chunk) REQUIRE (c.collection, c.id) IS UNIQUE"
+                ).consume()
+                session.run(
+                    "CREATE CONSTRAINT ai4rag_document_collection_id IF NOT EXISTS "
+                    "FOR (d:Document) REQUIRE (d.collection, d.id) IS UNIQUE"
+                ).consume()
+                session.run(
+                    "CREATE CONSTRAINT ai4rag_entity_identity IF NOT EXISTS "
+                    "FOR (e:__Entity__) REQUIRE e.ai4rag_entity_key IS UNIQUE"
+                ).consume()
+            self._canonical_schema_ready = True
+            logger.info(
+                "Neo4j canonical lookup constraints ready in %.2fs (collection=%s).",
+                perf_counter() - started_at,
+                self._collection_name,
+            )
 
     def _ensure_kg_schema(self, *, wait_until_online: bool = False) -> None:
         """Create this collection's vector index, optionally waiting for it to become queryable.
@@ -288,6 +348,7 @@ class Neo4jGraphStore(BaseVectorStore):
         if not documents:
             return
 
+        self._ensure_canonical_schema()
         started_at = perf_counter()
         embeddings = self.embedding_model.embed_documents([doc.text for doc in documents])
         logger.info(
@@ -367,6 +428,7 @@ class Neo4jGraphStore(BaseVectorStore):
         chunks = [chunk for chunk in chunks if chunk.text.strip()]
         if not chunks:
             return
+        self._kg_extraction_degraded = False
 
         batch_size = self._kg_extraction_config["batch_size"]
         batches = [chunks[index : index + batch_size] for index in range(0, len(chunks), batch_size)]
@@ -380,17 +442,23 @@ class Neo4jGraphStore(BaseVectorStore):
         )
 
         kg_writer = _CanonicalKGWriter(self._driver, self._config.database, self._collection_name)
-        # Ensure the shared temporary-node index before task fan-out. Each
-        # pipeline invocation calls this hook, but subsequent calls are no-ops.
-        kg_writer.ensure_setup()
+        response_format = (
+            KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT
+            if self._kg_extraction_config["response_format"] == "json_schema"
+            else KG_BATCH_RESPONSE_FORMAT
+        )
         llm = _LLMAdapter(
             model,
             max_completion_tokens=self._kg_extraction_config["max_completion_tokens"],
-            response_format=KG_BATCH_RESPONSE_FORMAT,
+            response_format=response_format,
         )
 
         async def _run_all() -> None:
             sem = asyncio.Semaphore(max_concurrent)
+            extracted_graphs: list[tuple[str, Neo4jGraph]] = []
+            extracted_graphs_lock = asyncio.Lock()
+            skipped_chunk_ids: list[str] = []
+            skipped_chunks_lock = asyncio.Lock()
 
             async def _request(batch: list[AI4RAGChunk]):
                 """Issue one request without holding a slot during retry backoff."""
@@ -406,9 +474,8 @@ class Neo4jGraphStore(BaseVectorStore):
                     try:
                         response = await _request(pending)
                         graphs, missing = self._parse_kg_batch_response(response.content, pending, on_error)
-                        for chunk, graph in graphs:
-                            with kg_writer.for_chunk(chunk.chunk_id):
-                                await kg_writer.run(graph, _KG_LEXICAL_GRAPH_CONFIG)
+                        async with extracted_graphs_lock:
+                            extracted_graphs.extend((chunk.chunk_id, graph) for chunk, graph in graphs)
                         if not missing:
                             return
                         pending = missing
@@ -418,6 +485,20 @@ class Neo4jGraphStore(BaseVectorStore):
                     except Exception as exc:  # pylint: disable=broad-except
                         if not _is_retryable_kg_extraction_error(exc):
                             raise
+                        if (
+                            isinstance(exc, _KGResponseFormatError)
+                            and exc.malformed_batch
+                            and len(pending) > 1
+                            and allow_singleton_fallback
+                        ):
+                            logger.warning(
+                                "Malformed KG batch response for collection=%s, chunk_ids=%s; "
+                                "retrying each chunk individually.",
+                                self._collection_name,
+                                [chunk.chunk_id for chunk in pending],
+                            )
+                            await asyncio.gather(*(_process_batch([chunk], False) for chunk in pending))
+                            return
                         max_attempts = (
                             _KG_RESPONSE_FORMAT_MAX_ATTEMPTS
                             if isinstance(exc, _KGResponseFormatError)
@@ -462,32 +543,51 @@ class Neo4jGraphStore(BaseVectorStore):
                             max_attempts,
                             exc,
                         )
+                        async with skipped_chunks_lock:
+                            skipped_chunk_ids.append(pending[0].chunk_id)
                         return
 
             await asyncio.gather(*(_process_batch(batch) for batch in batches))
+            kg_writer.write_graphs(extracted_graphs)
+            skipped_count = len(skipped_chunk_ids)
+            if skipped_count > self._kg_extraction_config["max_skipped_chunks"]:
+                message = "KG extraction is degraded for collection=%s: skipped %d of %d chunks " "(allowed=%d)."
+                self._kg_extraction_degraded = True
+                if self._kg_extraction_config["partial_failure_policy"] == "raise":
+                    raise _KGExtractionDegradedError(
+                        message
+                        % (
+                            self._collection_name,
+                            skipped_count,
+                            len(chunks),
+                            self._kg_extraction_config["max_skipped_chunks"],
+                        )
+                    )
+                logger.error(
+                    message,
+                    self._collection_name,
+                    skipped_count,
+                    len(chunks),
+                    self._kg_extraction_config["max_skipped_chunks"],
+                )
 
         try:
             with _suppress_neo4j_graphrag_info_logs():
                 asyncio.run(_run_all())
+        except _KGExtractionDegradedError:
+            raise
         except RuntimeError as exc:
             raise RuntimeError(
                 "_run_kg_pipeline cannot be called from within a running event loop. "
                 "Install 'nest_asyncio' and call nest_asyncio.apply() beforehand."
             ) from exc
 
-        with self._driver.session(database=self._config.database) as session:
-            session.run(
-                f"MATCH (e:{_SCHEMA.ENTITY_LABEL})-[:{_SCHEMA.FROM_CHUNK_RELATIONSHIP}]->("
-                f":`{self._collection_name}`:{_SCHEMA.CHUNK_LABEL}) "
-                f"SET e.{_SCHEMA.KG_COLLECTIONS} = CASE "
-                f"WHEN $col IN COALESCE(e.{_SCHEMA.KG_COLLECTIONS}, []) "
-                f"THEN e.{_SCHEMA.KG_COLLECTIONS} "
-                f"ELSE COALESCE(e.{_SCHEMA.KG_COLLECTIONS}, []) + $col END",
-                col=self._collection_name,
+        if not perform_entity_resolution:
+            logger.info(
+                "perform_entity_resolution=False is redundant: entity identity is resolved during KG ingestion "
+                "(collection=%s).",
+                self._collection_name,
             )
-
-        if perform_entity_resolution:
-            self._resolve_kg_entities()
 
         llm_calls, llm_elapsed_seconds, llm_format_repairs = llm.metrics
         logger.info(
@@ -531,6 +631,15 @@ class Neo4jGraphStore(BaseVectorStore):
             + '"properties":{"name":"entity name"}}],"relationships":[{"start_node_id":"local ID",'
             + '"end_node_id":"local ID","type":"RELATIONSHIP","properties":{}}]}]}\n'
             "Every input chunk_id must appear exactly once, including chunks with no entities (empty arrays).\n"
+            "Examples (format only; do not copy their facts or IDs):\n"
+            'Input: [{"chunk_id":"example-relationship","text":"Ada created Atlas."}]\n'
+            'Output: {"chunks":[{"chunk_id":"example-relationship","nodes":['
+            '{"id":"n1","label":"Person","properties":{"name":"Ada"}},'
+            '{"id":"n2","label":"Product","properties":{"name":"Atlas"}}],'
+            '"relationships":[{"start_node_id":"n2","end_node_id":"n1",'
+            '"type":"CREATED_BY","properties":{}}]}]}\n'
+            'Input: [{"chunk_id":"example-empty","text":"The and if or but."}]\n'
+            'Output: {"chunks":[{"chunk_id":"example-empty","nodes":[],"relationships":[]}]}\n'
             f"Input chunks:\n{json.dumps(payload)}"
         )
 
@@ -546,7 +655,9 @@ class Neo4jGraphStore(BaseVectorStore):
             if not isinstance(entries, list):
                 raise ValueError("chunks must be a list")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise _KGResponseFormatError("KG batch LLM response is not valid JSON with a chunks array.") from exc
+            raise _KGResponseFormatError(
+                "KG batch LLM response is not valid JSON with a chunks array.", malformed_batch=True
+            ) from exc
 
         graphs: list[tuple[AI4RAGChunk, Neo4jGraph]] = []
         seen_ids: set[str] = set()
@@ -572,28 +683,6 @@ class Neo4jGraphStore(BaseVectorStore):
             logger.warning("KG batch LLM response omitted or invalidated %d requested chunks.", len(missing))
         return graphs, missing
 
-    def _resolve_kg_entities(self) -> None:
-        """Merge same-type, same-name entities exclusive to this collection."""
-        with self._driver.session(database=self._config.database) as session:
-            session.run(
-                f"MATCH (entity:{_SCHEMA.ENTITY_LABEL})-[:{_SCHEMA.FROM_CHUNK_RELATIONSHIP}]->("
-                f":`{self._collection_name}`:{_SCHEMA.CHUNK_LABEL}) "
-                f"WHERE entity.{_SCHEMA.KG_COLLECTIONS} = [$col] "
-                "AND entity.name IS NOT NULL "
-                "WITH DISTINCT entity, head([label IN labels(entity) "
-                f"WHERE NOT label IN ['{_SCHEMA.ENTITY_LABEL}', '{_SCHEMA.KG_BUILDER_LABEL}']]) AS entity_label "
-                "WHERE entity_label IS NOT NULL "
-                "WITH entity_label, entity.name AS name, collect(entity) AS entities "
-                "WHERE size(entities) > 1 "
-                "WITH entities, reduce(owners = [], e IN entities | "
-                f"owners + COALESCE(e.{_SCHEMA.KG_COLLECTIONS}, [])) AS owners "
-                "CALL apoc.refactor.mergeNodes(entities, {properties: 'discard', mergeRels: false}) YIELD node "
-                f"SET node.{_SCHEMA.KG_COLLECTIONS} = reduce(unique = [], owner IN owners | "
-                "CASE WHEN owner IN unique THEN unique ELSE unique + owner END) "
-                "RETURN count(node) AS merged_groups",
-                col=self._collection_name,
-            )
-
     def _upsert_doc_groups(self, doc_groups: list[tuple[str, list[tuple[AI4RAGChunk, list[float]]]]]) -> None:
         with self._driver.session(database=self._config.database) as session:
             session.execute_write(self._upsert_batch_tx, doc_groups, self._collection_name)
@@ -609,7 +698,14 @@ class Neo4jGraphStore(BaseVectorStore):
         next_chunk_rows: list[dict[str, str]] = []
         for doc_id, sorted_pairs in doc_groups:
             source = sorted_pairs[0][0].metadata.get("source", "")
-            document_rows.append({"id": doc_id, "source": source, "metadata": json.dumps({"source": source})})
+            document_rows.append(
+                {
+                    "id": doc_id,
+                    "source": source,
+                    "metadata": json.dumps({"source": source}),
+                    "collection": collection_name,
+                }
+            )
             for chunk, embedding in sorted_pairs:
                 clean_metadata = {**chunk.metadata, "source": chunk.metadata.get("source") or doc_id}
                 chunk_rows.append(
@@ -629,25 +725,32 @@ class Neo4jGraphStore(BaseVectorStore):
             )
 
         tx.run(
-            f"UNWIND $rows AS row MERGE (d:{collection_name}:{_SCHEMA.DOCUMENT_LABEL} {{{_SCHEMA.ID}: row.id}}) "
-            f"SET d.{_SCHEMA.SOURCE} = row.source, d.{_SCHEMA.METADATA} = row.metadata",
+            f"UNWIND $rows AS row MERGE (d:{collection_name}:{_SCHEMA.DOCUMENT_LABEL} "
+            f"{{{_SCHEMA.COLLECTION}: row.collection, {_SCHEMA.ID}: row.id}}) "
+            f"SET d.{_SCHEMA.COLLECTION} = row.collection, d.{_SCHEMA.SOURCE} = row.source, "
+            f"d.{_SCHEMA.METADATA} = row.metadata",
             rows=document_rows,
         ).consume()
         tx.run(
-            f"UNWIND $rows AS row MERGE (c:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: row.id}}) "
+            f"UNWIND $rows AS row MERGE (c:{collection_name}:{_SCHEMA.CHUNK_LABEL} "
+            f"{{{_SCHEMA.COLLECTION}: row.collection, {_SCHEMA.ID}: row.id}}) "
             f"SET c.{_SCHEMA.TEXT} = row.text, c.{_SCHEMA.EMBEDDING} = row.embedding, "
             f"c.{_SCHEMA.DOCUMENT_ID} = row.document_id, c.{_SCHEMA.SEQUENCE_NUMBER} = row.sequence_number, "
             f"c.{_SCHEMA.METADATA} = row.metadata, c.{_SCHEMA.COLLECTION} = row.collection "
-            f"WITH c, row MATCH (d:{collection_name}:{_SCHEMA.DOCUMENT_LABEL} {{{_SCHEMA.ID}: row.document_id}}) "
+            f"WITH c, row MATCH (d:{collection_name}:{_SCHEMA.DOCUMENT_LABEL} "
+            f"{{{_SCHEMA.COLLECTION}: row.collection, {_SCHEMA.ID}: row.document_id}}) "
             f"MERGE (d)-[:{_SCHEMA.CONTAINS_RELATIONSHIP}]->(c)",
             rows=chunk_rows,
         ).consume()
         if next_chunk_rows:
             tx.run(
-                f"UNWIND $rows AS row MATCH (a:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: row.id_a}}) "
-                f"MATCH (b:{collection_name}:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: row.id_b}}) "
+                f"UNWIND $rows AS row MATCH (a:{collection_name}:{_SCHEMA.CHUNK_LABEL} "
+                f"{{{_SCHEMA.COLLECTION}: $col, {_SCHEMA.ID}: row.id_a}}) "
+                f"MATCH (b:{collection_name}:{_SCHEMA.CHUNK_LABEL} "
+                f"{{{_SCHEMA.COLLECTION}: $col, {_SCHEMA.ID}: row.id_b}}) "
                 f"MERGE (a)-[:{_SCHEMA.NEXT_CHUNK_RELATIONSHIP}]->(b)",
                 rows=next_chunk_rows,
+                col=collection_name,
             ).consume()
 
     def search(

@@ -5,6 +5,7 @@
 """Private adapters and helpers used by `ai4rag.rag.vector_store.neo4j`."""
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -50,6 +51,7 @@ class Neo4jGraphSchema:
     COLLECTION = "collection"
     SOURCE = "source"
     KG_COLLECTIONS = "ai4rag_kg_collections"
+    ENTITY_KEY = "ai4rag_entity_key"
 
 
 _SCHEMA = Neo4jGraphSchema
@@ -68,6 +70,33 @@ KG_MAX_RELATIONSHIPS_PER_CHUNK = 6
 # prompt and local validation retain the application contract without repeatedly
 # retrying an unsupported response-format capability.
 KG_BATCH_RESPONSE_FORMAT = {"type": "json_object"}
+KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "kg_batch",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "chunks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "chunk_id": {"type": "string"},
+                            "nodes": {"type": "array"},
+                            "relationships": {"type": "array"},
+                        },
+                        "required": ["chunk_id", "nodes", "relationships"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["chunks"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # GraphRAG's lexical nodes are temporary: _CanonicalKGWriter discards them in
 # favor of the canonical nodes already stored by add_documents. Keep their
@@ -101,6 +130,9 @@ def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, A
             "mode": "constrained",
             "max_completion_tokens": DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS,
             "batch_size": DEFAULT_KG_EXTRACTION_BATCH_SIZE,
+            "response_format": "json_object",
+            "max_skipped_chunks": 0,
+            "partial_failure_policy": "degrade",
         }
     if not isinstance(config, dict):
         raise TypeError("kg_extraction_config must be a dictionary or None.")
@@ -118,8 +150,25 @@ def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, A
     batch_size = config.get("batch_size", DEFAULT_KG_EXTRACTION_BATCH_SIZE)
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("kg_extraction_config.batch_size must be a positive integer.")
+    response_format = config.get("response_format", "json_object")
+    if response_format not in {"json_object", "json_schema"}:
+        raise ValueError("kg_extraction_config.response_format must be 'json_object' or 'json_schema'.")
+    max_skipped_chunks = config.get("max_skipped_chunks", 0)
+    if isinstance(max_skipped_chunks, bool) or not isinstance(max_skipped_chunks, int) or max_skipped_chunks < 0:
+        raise ValueError("kg_extraction_config.max_skipped_chunks must be a non-negative integer.")
+    partial_failure_policy = config.get("partial_failure_policy", "degrade")
+    if partial_failure_policy not in {"degrade", "raise"}:
+        raise ValueError("kg_extraction_config.partial_failure_policy must be 'degrade' or 'raise'.")
+    common = {
+        "mode": mode,
+        "max_completion_tokens": max_completion_tokens,
+        "batch_size": batch_size,
+        "response_format": response_format,
+        "max_skipped_chunks": max_skipped_chunks,
+        "partial_failure_policy": partial_failure_policy,
+    }
     if mode == "constrained":
-        return {"mode": mode, "max_completion_tokens": max_completion_tokens, "batch_size": batch_size}
+        return common
 
     limits = {
         "max_entities_per_chunk": config.get("max_entities_per_chunk"),
@@ -128,7 +177,7 @@ def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, A
     for name, value in limits.items():
         if not isinstance(value, int) or value < 1:
             raise ValueError(f"kg_extraction_config.{name} must be a positive integer for free extraction.")
-    return {"mode": mode, "max_completion_tokens": max_completion_tokens, "batch_size": batch_size, **limits}
+    return {**common, **limits}
 
 
 def _kg_pipeline_extraction_options(config: dict[str, Any]) -> dict[str, Any]:
@@ -291,12 +340,29 @@ def _normalise_kg_response(content: str) -> str:
     policy, and never log model output because it contains source content.
     """
     stripped = content.strip()
+    recovered_embedded_object = False
     if stripped.startswith("```") and stripped.endswith("```"):
         stripped = stripped.split("\n", maxsplit=1)[-1].rsplit("```", maxsplit=1)[0].strip()
     try:
         parsed = json.loads(stripped)
     except json.JSONDecodeError:
-        return content
+        # Some MaaS deployments add a short preamble despite JSON-object mode.
+        # Recover only an already-valid, balanced object; never synthesize data.
+        decoder = json.JSONDecoder()
+        parsed = None
+        for offset, character in enumerate(stripped):
+            if character != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(stripped[offset:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                parsed = candidate
+                recovered_embedded_object = True
+                break
+        if parsed is None:
+            return content
 
     if isinstance(parsed, list):
         if len(parsed) == 1 and isinstance(parsed[0], dict):
@@ -309,7 +375,7 @@ def _normalise_kg_response(content: str) -> str:
         if isinstance(parsed["chunks"], list):
             return (
                 content
-                if content == stripped and set(parsed) == {"chunks"}
+                if not recovered_embedded_object and content == stripped and set(parsed) == {"chunks"}
                 else json.dumps({"chunks": parsed["chunks"]})
             )
         return content
@@ -318,7 +384,7 @@ def _normalise_kg_response(content: str) -> str:
     relationships = parsed.get("relationships", parsed.get("relations", []))
     if not isinstance(nodes, list) or not isinstance(relationships, list):
         return content
-    if content == stripped and set(parsed) == {"nodes", "relationships"}:
+    if not recovered_embedded_object and content == stripped and set(parsed) == {"nodes", "relationships"}:
         return content
     return json.dumps({"nodes": nodes, "relationships": relationships})
 
@@ -413,7 +479,6 @@ class _CanonicalKGWriter(_CollectionKGWriter):
 
     def __init__(self, driver: neo4j.Driver, database: str, collection_name: str) -> None:
         super().__init__(driver, database, collection_name)
-        self._links: ContextVar[tuple[str, list[str]] | None] = ContextVar("canonical_kg_links", default=None)
         self._chunk_id: ContextVar[str | None] = ContextVar("canonical_kg_chunk_id", default=None)
 
     @contextmanager
@@ -424,6 +489,121 @@ class _CanonicalKGWriter(_CollectionKGWriter):
             yield
         finally:
             self._chunk_id.reset(token)
+
+    def write_graphs(self, graphs: list[tuple[str, Neo4jGraph]]) -> None:
+        """Persist extracted graphs with collection-scoped entity identities.
+
+        The upstream writer creates temporary nodes for every extraction and
+        resolves duplicates in a later APOC pass.  That makes indexing more
+        expensive as the graph grows.  Instead, entity nodes are merged by a
+        stable key composed from collection, type, and normalized name.  Nodes
+        without a name remain local to their source chunk to avoid an unsafe
+        merge.  All rows are written in bounded transactions.
+        """
+        node_rows: list[dict[str, Any]] = []
+        relationship_rows: list[dict[str, Any]] = []
+        link_rows: list[dict[str, str]] = []
+
+        for chunk_id, graph in graphs:
+            entities = [
+                node for node in graph.nodes if node.label not in _KG_LEXICAL_GRAPH_CONFIG.lexical_graph_node_labels
+            ]
+            key_by_id = {node.id: self._entity_key(chunk_id, node.id, node.label, node.properties) for node in entities}
+            for node in entities:
+                node_rows.append(
+                    {
+                        "key": key_by_id[node.id],
+                        "labels": [node.label, _SCHEMA.ENTITY_LABEL],
+                        "properties": node.properties,
+                    }
+                )
+                link_rows.append({"key": key_by_id[node.id], "chunk_id": chunk_id})
+            relationship_rows.extend(
+                {
+                    "start_key": key_by_id[relationship.start_node_id],
+                    "end_key": key_by_id[relationship.end_node_id],
+                    "type": relationship.type,
+                    "properties": relationship.properties,
+                }
+                for relationship in graph.relationships
+                if relationship.start_node_id in key_by_id and relationship.end_node_id in key_by_id
+            )
+
+        started_at = perf_counter()
+        for offset in range(0, len(node_rows), self.batch_size):
+            self._write_entity_batch(node_rows[offset : offset + self.batch_size])
+        for offset in range(0, len(relationship_rows), self.batch_size):
+            self._write_relationship_batch(relationship_rows[offset : offset + self.batch_size])
+        for offset in range(0, len(link_rows), self.batch_size):
+            self._write_link_batch(link_rows[offset : offset + self.batch_size])
+        with self._write_lock:
+            self._write_elapsed_seconds += perf_counter() - started_at
+
+    def _entity_key(self, chunk_id: str, node_id: str, label: str, properties: dict[str, Any]) -> str:
+        name = properties.get("name")
+        identity = (
+            f"{self._collection_name}\x00{label.casefold()}\x00{' '.join(name.split()).casefold()}"
+            if isinstance(name, str) and name.strip()
+            else f"{self._collection_name}\x00{chunk_id}\x00{node_id}"
+        )
+        return hashlib.sha256(identity.encode()).hexdigest()
+
+    def _write_entity_batch(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        with self.driver.session(database=self.neo4j_database) as session:
+            session.execute_write(self._write_entity_batch_tx, rows, self._collection_name)
+
+    @staticmethod
+    def _write_entity_batch_tx(tx: neo4j.Transaction, rows: list[dict[str, Any]], collection_name: str) -> None:
+        tx.run(
+            "UNWIND $rows AS row "
+            "CALL apoc.merge.node(row.labels, {ai4rag_entity_key: row.key}, {}) YIELD node "
+            "SET node += row.properties, node.ai4rag_entity_key = row.key "
+            "SET node.ai4rag_kg_collections = CASE "
+            "WHEN $col IN COALESCE(node.ai4rag_kg_collections, []) THEN node.ai4rag_kg_collections "
+            "ELSE COALESCE(node.ai4rag_kg_collections, []) + $col END",
+            rows=rows,
+            col=collection_name,
+        ).consume()
+
+    def _write_relationship_batch(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        with self.driver.session(database=self.neo4j_database) as session:
+            session.execute_write(self._write_relationship_batch_tx, rows, self._collection_name)
+
+    @staticmethod
+    def _write_relationship_batch_tx(tx: neo4j.Transaction, rows: list[dict[str, Any]], collection_name: str) -> None:
+        tx.run(
+            "UNWIND $rows AS row "
+            "MATCH (start:__Entity__ {ai4rag_entity_key: row.start_key}) "
+            "WITH start, row MATCH (end:__Entity__ {ai4rag_entity_key: row.end_key}) "
+            "CALL apoc.merge.relationship(start, row.type, {}, row.properties, end, row.properties) YIELD rel "
+            "SET rel.ai4rag_kg_collections = CASE "
+            "WHEN $col IN COALESCE(rel.ai4rag_kg_collections, []) THEN rel.ai4rag_kg_collections "
+            "ELSE COALESCE(rel.ai4rag_kg_collections, []) + $col END",
+            rows=rows,
+            col=collection_name,
+        ).consume()
+
+    def _write_link_batch(self, rows: list[dict[str, str]]) -> None:
+        if not rows:
+            return
+        with self.driver.session(database=self.neo4j_database) as session:
+            session.execute_write(self._write_link_batch_tx, rows, self._collection_name)
+
+    @staticmethod
+    def _write_link_batch_tx(tx: neo4j.Transaction, rows: list[dict[str, str]], collection_name: str) -> None:
+        tx.run(
+            "UNWIND $rows AS row "
+            "MATCH (e:__Entity__ {ai4rag_entity_key: row.key}) "
+            f"MATCH (c:`{collection_name}`:{_SCHEMA.CHUNK_LABEL} "
+            f"{{{_SCHEMA.COLLECTION}: $col, {_SCHEMA.ID}: row.chunk_id}}) "
+            f"MERGE (e)-[:{_SCHEMA.FROM_CHUNK_RELATIONSHIP}]->(c)",
+            rows=rows,
+            col=collection_name,
+        ).consume()
 
     async def run(
         self,
@@ -453,37 +633,14 @@ class _CanonicalKGWriter(_CollectionKGWriter):
         # This pipeline processes one canonical chunk per run. GraphRAG may omit
         # lexical nodes and FROM_CHUNK edges, but all extracted entities still
         # belong to that chunk.
-        linked_entity_ids = sorted(entity_ids)
         entity_graph = Neo4jGraph(
             nodes=entity_nodes,
             relationships=[
                 rel for rel in graph.relationships if rel.start_node_id in entity_ids and rel.end_node_id in entity_ids
             ],
         )
-        token = self._links.set((chunk_id, linked_entity_ids))
-        try:
-            return await super().run(entity_graph, lexical_graph_config)
-        finally:
-            self._links.reset(token)
-
-    def _db_cleaning(self) -> None:
-        links = self._links.get()
-        if links is not None:
-            chunk_id, entity_ids = links
-            if entity_ids:
-                self.driver.execute_query(
-                    f"UNWIND $entity_ids AS entity_id "
-                    f"MATCH (e:{_SCHEMA.ENTITY_LABEL} {{__tmp_internal_id: entity_id}}) "
-                    f"MATCH (c:`{self._collection_name}`:{_SCHEMA.CHUNK_LABEL} {{{_SCHEMA.ID}: $chunk_id}}) "
-                    f"MERGE (e)-[:{_SCHEMA.FROM_CHUNK_RELATIONSHIP}]->(c) "
-                    f"SET e.{_SCHEMA.KG_COLLECTIONS} = CASE "
-                    f"WHEN $col IN COALESCE(e.{_SCHEMA.KG_COLLECTIONS}, []) "
-                    f"THEN e.{_SCHEMA.KG_COLLECTIONS} "
-                    f"ELSE COALESCE(e.{_SCHEMA.KG_COLLECTIONS}, []) + $col END",
-                    parameters_={"entity_ids": entity_ids, "chunk_id": chunk_id, "col": self._collection_name},
-                    database_=self.neo4j_database,
-                )
-        super()._db_cleaning()
+        self.write_graphs([(chunk_id, entity_graph)])
+        return KGWriterModel(status="SUCCESS", metadata={"files": [], "statistics": {}})
 
 
 def _build_graph_retrieval_query(
