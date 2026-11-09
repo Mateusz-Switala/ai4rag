@@ -7,7 +7,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import random
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -30,14 +29,13 @@ from ai4rag.rag.foundation_models.base_model import BaseFoundationModel
 from ai4rag.rag.vector_store.base_vector_store import BaseVectorStore
 from ai4rag.rag.vector_store.config import Neo4jConfig
 from ai4rag.rag.vector_store.neo4j_utils import (
-    _KG_LEXICAL_GRAPH_CONFIG,
+    KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT,
     KG_BATCH_RESPONSE_FORMAT,
     KG_MAX_ENTITIES_PER_CHUNK,
     KG_MAX_RELATIONSHIPS_PER_CHUNK,
     Neo4jGraphSchema,
     _build_graph_retrieval_query,
     _CanonicalKGWriter,
-    KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT,
     _collection_vector_index_name,
     _EmbedderAdapter,
     _LLMAdapter,
@@ -81,15 +79,6 @@ def _suppress_neo4j_graphrag_info_logs() -> Iterator[None]:
 
 _CUSTOM_CA_URI_SCHEMES = {"neo4j+s": "neo4j", "bolt+s": "bolt"}
 _KG_NEO4J_RETRY_ATTEMPTS = 3
-_RETRYABLE_NEO4J_EXCEPTIONS = (
-    neo4j.exceptions.ServiceUnavailable,
-    neo4j.exceptions.SessionExpired,
-    neo4j.exceptions.TransientError,
-)
-_RETRYABLE_LLM_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
-_KG_EXTRACTION_MAX_ATTEMPTS = 3
-_KG_RESPONSE_FORMAT_MAX_ATTEMPTS = 2
-_KG_EXTRACTION_BACKOFF_JITTER_SECONDS = 0.25
 
 
 class _KGResponseFormatError(ValueError):
@@ -104,13 +93,9 @@ class _KGExtractionDegradedError(RuntimeError):
     """KG extraction exceeded the caller's tolerated partial-failure budget."""
 
 
-def _is_retryable_kg_extraction_error(error: Exception) -> bool:
-    """Return whether *error* is transient enough to retry KG extraction."""
-    if isinstance(error, _KGResponseFormatError):
-        return True
-    if isinstance(error, _RETRYABLE_NEO4J_EXCEPTIONS):
-        return True
-    return getattr(error, "status_code", None) in _RETRYABLE_LLM_STATUS_CODES
+def _is_malformed_kg_batch_response(error: Exception) -> bool:
+    """Return whether an extraction failure is a malformed batch response."""
+    return isinstance(error, _KGResponseFormatError) and error.malformed_batch
 
 
 def _normalize_custom_ca_uri(uri: str) -> str:
@@ -414,8 +399,9 @@ class Neo4jGraphStore(BaseVectorStore):
         return value
 
     # The adapters, writer, and pipeline are deliberately retained for phase
-    # metrics after asynchronous extraction completes.
-    # pylint: disable-next=too-many-locals
+    # metrics after asynchronous extraction completes. The nested batch processor
+    # tracks request, retry, fallback, and degradation state.
+    # pylint: disable-next=too-many-locals,too-many-statements
     def _run_kg_pipeline(
         self,
         chunks: list[AI4RAGChunk],
@@ -469,90 +455,55 @@ class Neo4jGraphStore(BaseVectorStore):
                     )
 
             async def _process_batch(batch: list[AI4RAGChunk], allow_singleton_fallback: bool = True) -> None:
-                """Extract one batch with bounded retries and isolated failed chunks."""
+                """Extract one batch and isolate schema-invalid responses by chunk."""
                 pending = batch
-                for attempt in range(1, _KG_EXTRACTION_MAX_ATTEMPTS + 1):
-                    try:
-                        response = await _request(pending)
-                        graphs, missing = self._parse_kg_batch_response(response.content, pending, on_error)
-                        async with extracted_graphs_lock:
-                            extracted_graphs.extend((chunk.chunk_id, graph) for chunk, graph in graphs)
-                        if not missing:
-                            return
-                        pending = missing
-                        raise _KGResponseFormatError(
-                            f"KG batch LLM response omitted or invalidated {len(missing)} requested chunks."
-                        )
-                    except Exception as exc:  # pylint: disable=broad-except
-                        if not _is_retryable_kg_extraction_error(exc):
-                            raise
-                        if (
-                            isinstance(exc, _KGResponseFormatError)
-                            and exc.malformed_batch
-                            and len(pending) > 1
-                            and allow_singleton_fallback
-                        ):
-                            logger.warning(
-                                "Malformed KG batch response for collection=%s, chunk_ids=%s; "
-                                "retrying each chunk individually.",
-                                self._collection_name,
-                                [chunk.chunk_id for chunk in pending],
-                            )
-                            await asyncio.gather(*(_process_batch([chunk], False) for chunk in pending))
-                            return
-                        max_attempts = (
-                            _KG_RESPONSE_FORMAT_MAX_ATTEMPTS
-                            if isinstance(exc, _KGResponseFormatError)
-                            else _KG_EXTRACTION_MAX_ATTEMPTS
-                        )
-                        # Singleton fallback is a final, bounded probe. Do
-                        # not multiply a failed batch's retry budget again.
-                        if not allow_singleton_fallback:
-                            max_attempts = 1
-                        if attempt < max_attempts:
-                            delay_seconds = (2 ** (attempt - 1)) + random.uniform(
-                                0, _KG_EXTRACTION_BACKOFF_JITTER_SECONDS
-                            )
-                            logger.warning(
-                                "Transient KG extraction failure for collection=%s, chunk_ids=%s; "
-                                "retrying batch (%d/%d) in %.2fs: %s",
-                                self._collection_name,
-                                [chunk.chunk_id for chunk in pending],
-                                attempt,
-                                max_attempts,
-                                delay_seconds,
-                                exc,
-                            )
-                            await asyncio.sleep(delay_seconds)
-                            continue
-                        if len(pending) > 1 and allow_singleton_fallback:
-                            logger.warning(
-                                "KG extraction failed after %d attempts for collection=%s, chunk_ids=%s; "
-                                "retrying failed chunks individually.",
-                                max_attempts,
-                                self._collection_name,
-                                [chunk.chunk_id for chunk in pending],
-                            )
-                            await asyncio.gather(*(_process_batch([chunk], False) for chunk in pending))
-                            return
-                        if on_error == "RAISE":
-                            raise
-                        logger.error(
-                            "Skipping KG extraction for collection=%s, chunk_id=%s after %d transient failures: %s",
-                            self._collection_name,
-                            pending[0].chunk_id,
-                            max_attempts,
-                            exc,
-                        )
-                        async with skipped_chunks_lock:
-                            skipped_chunk_ids.append(pending[0].chunk_id)
+                try:
+                    response = await _request(pending)
+                    graphs, missing = self._parse_kg_batch_response(response.content, pending, on_error)
+                    async with extracted_graphs_lock:
+                        extracted_graphs.extend((chunk.chunk_id, graph) for chunk, graph in graphs)
+                    if not missing:
                         return
+                    pending = missing
+                    raise _KGResponseFormatError(
+                        f"KG batch LLM response omitted or invalidated {len(missing)} requested chunks."
+                    )
+                except _KGResponseFormatError as exc:
+                    if len(batch) > 1 and allow_singleton_fallback:
+                        response_kind = "Malformed" if _is_malformed_kg_batch_response(exc) else "Incomplete"
+                        logger.warning(
+                            "%s KG batch response for collection=%s, chunk_ids=%s; retrying each chunk individually.",
+                            response_kind,
+                            self._collection_name,
+                            [chunk.chunk_id for chunk in pending],
+                        )
+                        await asyncio.gather(*(_process_batch([chunk], False) for chunk in pending))
+                        return
+                    if on_error == "RAISE":
+                        raise
+                    logger.error(
+                        "Skipping KG extraction for collection=%s, chunk_id=%s after an invalid LLM response: %s",
+                        self._collection_name,
+                        pending[0].chunk_id,
+                        exc,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    if on_error == "RAISE":
+                        raise
+                    logger.error(
+                        "Skipping KG extraction for collection=%s, chunk_ids=%s after SDK retry failure: %s",
+                        self._collection_name,
+                        [chunk.chunk_id for chunk in pending],
+                        exc,
+                    )
+                async with skipped_chunks_lock:
+                    skipped_chunk_ids.extend(chunk.chunk_id for chunk in pending)
 
             await asyncio.gather(*(_process_batch(batch) for batch in batches))
             kg_writer.write_graphs(extracted_graphs)
             skipped_count = len(skipped_chunk_ids)
             if skipped_count > self._kg_extraction_config["max_skipped_chunks"]:
-                message = "KG extraction is degraded for collection=%s: skipped %d of %d chunks " "(allowed=%d)."
+                message = "KG extraction is degraded for collection=%s: skipped %d of %d chunks (allowed=%d)."
                 self._kg_extraction_degraded = True
                 if self._kg_extraction_config["partial_failure_policy"] == "raise":
                     raise _KGExtractionDegradedError(
@@ -631,7 +582,8 @@ class Neo4jGraphStore(BaseVectorStore):
             f"{schema}\n"
             f"For each chunk, extract at most {max_entities} entities and "
             f"{max_relationships} relationships. Node properties must contain only "
-            "the entity name. Relationship properties must be empty.\n"
+            "the entity name. Relationship properties must be empty. If a selected "
+            "schema requires an entity or relationship description, use only a concise phrase.\n"
             "Return only this JSON object, with exactly this structure:\n"
             + '{"chunks":[{"chunk_id":"input chunk ID","nodes":[{"id":"local ID","label":"type",'
             + '"properties":{"name":"entity name"}}],"relationships":[{"start_node_id":"local ID",'
