@@ -25,6 +25,7 @@ from neo4j_graphrag.llm.types import LLMResponse
 from neo4j_graphrag.neo4j_queries import db_cleaning_query
 from neo4j_graphrag.types import LLMMessage
 
+from ai4rag import logger
 from ai4rag.rag.embedding.base_model import BaseEmbeddingModel
 from ai4rag.rag.foundation_models.base_model import BaseFoundationModel
 from ai4rag.rag.vector_store.utils import validate_search_params
@@ -291,6 +292,16 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         with self._metrics_lock:
             self._calls += 1
             self._elapsed_seconds += perf_counter() - started_at
+        stop_reason = (
+            response.get("finish_reason")
+            if isinstance(response, Mapping)
+            else getattr(response, "finish_reason", None)
+        )
+        logger.info(
+            "KG extraction LLM response received (model=%s, stop_reason=%s).",
+            self._model.model_id,
+            stop_reason if isinstance(stop_reason, (str, int, float)) else "unknown",
+        )
         content = (response["content"] if isinstance(response, Mapping) else response.message.content) or ""
         normalised_content = _normalise_kg_response(content)
         if normalised_content != content:

@@ -124,6 +124,20 @@ def test_llm_adapter_requests_a_json_object_response():
     )
 
 
+def test_llm_adapter_logs_the_kg_response_stop_reason(caplog):
+    model = MagicMock(model_id="test-model")
+    model.chat.return_value = [
+        SimpleNamespace(finish_reason="length", message=SimpleNamespace(content='{"chunks": []}'))
+    ]
+
+    with caplog.at_level(logging.INFO):
+        _LLMAdapter(model, response_format=KG_BATCH_RESPONSE_FORMAT).invoke(
+            [{"role": "user", "content": "Extract entities."}]
+        )
+
+    assert "KG extraction LLM response received (model=test-model, stop_reason=length)." in caplog.messages
+
+
 def test_llm_adapter_repairs_fenced_singleton_kg_response():
     model = MagicMock(model_id="test-model")
     model.chat.return_value = [
