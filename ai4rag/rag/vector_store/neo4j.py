@@ -175,7 +175,7 @@ class Neo4jGraphStore(BaseVectorStore):
     """
 
     _BATCH_SIZE = 512
-    _DEFAULT_KG_EXTRACTION_CONCURRENCY = 2
+    _DEFAULT_KG_EXTRACTION_CONCURRENCY = 4
     _VECTOR_INDEX_WAIT_SECONDS = 600
 
     def __init__(
@@ -328,7 +328,7 @@ class Neo4jGraphStore(BaseVectorStore):
               omitted and no model was supplied at construction, graph search
               returns ANN seed chunks without entity-based context expansion.
             - ``kg_max_concurrent`` (int) — maximum concurrent KG extraction
-              requests when a foundation model is present (default 2).
+              requests when a foundation model is present (default 4).
         """
         if not documents:
             return
