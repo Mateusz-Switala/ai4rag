@@ -622,7 +622,7 @@ class TestAddDocuments:
             store._run_kg_pipeline(chunks, MagicMock(), perform_entity_resolution=False)
 
         assert (
-            "Starting entity extraction for 2 chunks in 1 batches (batch_size=2, max_concurrent=2, collection=ai4rag_col)."
+            "Starting entity extraction for 2 chunks in 1 batches (batch_size=2, max_concurrent=4, collection=ai4rag_col)."
             in caplog.messages
         )
         assert "Finished entity extraction for 2 chunks (collection=ai4rag_col)." in caplog.messages
