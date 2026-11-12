@@ -60,10 +60,10 @@ _SCHEMA = Neo4jGraphSchema
 
 _CONSTRAINED_KG_ENTITIES = ("Person", "Organization", "Place", "Concept", "Event", "Product", "Technology")
 _CONSTRAINED_KG_RELATIONS = ("RELATED_TO", "PART_OF", "LOCATED_IN", "BELONGS_TO", "CREATED_BY", "MENTIONS")
-DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 2048
-# Entity extraction is generation-heavy. Two chunks per request amortises
-# request overhead while retaining chunk-level provenance.
-DEFAULT_KG_EXTRACTION_BATCH_SIZE = 2
+# Keep KG extraction requests short enough to avoid gateway timeouts for
+# constrained graph generation.
+DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 768
+DEFAULT_KG_EXTRACTION_BATCH_SIZE = 1
 KG_MAX_ENTITIES_PER_CHUNK = 6
 KG_MAX_RELATIONSHIPS_PER_CHUNK = 6
 # MaaS' OpenAI-compatible endpoint accepts JSON-object mode, but the deployed

@@ -278,8 +278,11 @@ class TestNeo4jConfig:
 
 
 class TestKGExtractionConfig:
-    def test_default_completion_limit_is_2048(self):
-        assert _validate_kg_extraction_config(None)["max_completion_tokens"] == 2048
+    def test_default_completion_limit_is_768(self):
+        assert _validate_kg_extraction_config(None)["max_completion_tokens"] == 768
+
+    def test_default_batch_size_is_one_chunk(self):
+        assert _validate_kg_extraction_config(None)["batch_size"] == 1
 
     def test_rejects_boolean_completion_limit(self):
         with pytest.raises(ValueError, match="max_completion_tokens must be a positive integer"):
@@ -622,14 +625,16 @@ class TestAddDocuments:
             store._run_kg_pipeline(chunks, MagicMock(), perform_entity_resolution=False)
 
         assert (
-            "Starting entity extraction for 2 chunks in 1 batches (batch_size=2, max_concurrent=4, collection=ai4rag_col)."
+            "Starting entity extraction for 2 chunks in 2 batches (batch_size=1, max_concurrent=4, collection=ai4rag_col)."
             in caplog.messages
         )
         assert "Finished entity extraction for 2 chunks (collection=ai4rag_col)." in caplog.messages
 
     def test_kg_pipeline_skips_an_sdk_exhausted_llm_batch(self, mock_driver_cls, mock_embedding, neo4j_config):
         """A transport failure is not retried outside the foundation-model SDK."""
-        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        store = Neo4jGraphStore(
+            mock_embedding, neo4j_config, collection_name="ai4rag_col", kg_extraction_config={"batch_size": 2}
+        )
         completion_limits: list[int] = []
 
         class GatewayError(Exception):
@@ -647,14 +652,16 @@ class TestAddDocuments:
         with patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline):
             store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
 
-        assert completion_limits == [2048]
+        assert completion_limits == [768]
         assert store.is_kg_extraction_degraded
 
     def test_kg_pipeline_immediately_splits_an_improper_batch_response(
         self, mock_driver_cls, mock_embedding, neo4j_config
     ):
         """Malformed multi-chunk output is isolated without repeating the batch."""
-        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        store = Neo4jGraphStore(
+            mock_embedding, neo4j_config, collection_name="ai4rag_col", kg_extraction_config={"batch_size": 2}
+        )
         completion_limits: list[int] = []
 
         async def run_pipeline(_, prompt, completion_limit):
@@ -669,12 +676,14 @@ class TestAddDocuments:
         with patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline):
             store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
 
-        assert completion_limits == [2048, 2048, 2048]
+        assert completion_limits == [768, 768, 768]
 
     def test_kg_pipeline_retries_only_chunks_omitted_from_a_valid_batch(
         self, mock_driver_cls, mock_embedding, neo4j_config
     ):
-        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+        store = Neo4jGraphStore(
+            mock_embedding, neo4j_config, collection_name="ai4rag_col", kg_extraction_config={"batch_size": 2}
+        )
         request_sizes: list[int] = []
 
         async def run_pipeline(_, prompt, _completion_limit):
