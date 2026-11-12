@@ -278,8 +278,8 @@ class TestNeo4jConfig:
 
 
 class TestKGExtractionConfig:
-    def test_default_completion_limit_is_768(self):
-        assert _validate_kg_extraction_config(None)["max_completion_tokens"] == 768
+    def test_default_completion_limit_is_1024(self):
+        assert _validate_kg_extraction_config(None)["max_completion_tokens"] == 1024
 
     def test_default_batch_size_is_one_chunk(self):
         assert _validate_kg_extraction_config(None)["batch_size"] == 1
@@ -575,7 +575,7 @@ class TestAddDocuments:
         prompt = store._build_kg_batch_prompt([chunk])
         assert f"at most {KG_MAX_ENTITIES_PER_CHUNK} entities" in prompt
         assert f"{KG_MAX_RELATIONSHIPS_PER_CHUNK} relationships" in prompt
-        assert "description, use only a concise phrase" in prompt
+        assert "generate a concise, factual description of no more than 12 words" in prompt
         assert json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1]) == [
             {"chunk_id": chunk.chunk_id, "text": text}
         ]
@@ -652,7 +652,7 @@ class TestAddDocuments:
         with patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline):
             store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
 
-        assert completion_limits == [768]
+        assert completion_limits == [1024]
         assert store.is_kg_extraction_degraded
 
     def test_kg_pipeline_immediately_splits_an_improper_batch_response(
@@ -676,7 +676,7 @@ class TestAddDocuments:
         with patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline):
             store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
 
-        assert completion_limits == [768, 768, 768]
+        assert completion_limits == [1024, 1024, 1024]
 
     def test_kg_pipeline_retries_only_chunks_omitted_from_a_valid_batch(
         self, mock_driver_cls, mock_embedding, neo4j_config

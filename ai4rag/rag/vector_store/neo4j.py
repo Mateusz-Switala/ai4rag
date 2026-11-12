@@ -582,8 +582,9 @@ class Neo4jGraphStore(BaseVectorStore):
             f"{schema}\n"
             f"For each chunk, extract at most {max_entities} entities and "
             f"{max_relationships} relationships. Node properties must contain only "
-            "the entity name. Relationship properties must be empty. If a selected "
-            "schema requires an entity or relationship description, use only a concise phrase.\n"
+            "the entity name. Relationship properties must be empty. When the selected "
+            "schema requires an entity or relationship description, generate a concise, factual description "
+            "of no more than 12 words.\n"
             "Return only this JSON object, with exactly this structure:\n"
             + '{"chunks":[{"chunk_id":"input chunk ID","nodes":[{"id":"local ID","label":"type",'
             + '"properties":{"name":"entity name"}}],"relationships":[{"start_node_id":"local ID",'
