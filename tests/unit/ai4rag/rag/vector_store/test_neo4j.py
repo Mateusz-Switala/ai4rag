@@ -371,8 +371,8 @@ class TestKGExtractionConfig:
     def test_default_completion_limit_is_1024(self):
         assert _validate_kg_extraction_config(None)["max_completion_tokens"] == 1024
 
-    def test_default_batch_size_is_two_chunks(self):
-        assert _validate_kg_extraction_config(None)["batch_size"] == 2
+    def test_default_batch_size_is_one_chunk(self):
+        assert _validate_kg_extraction_config(None)["batch_size"] == 1
 
     def test_rejects_boolean_completion_limit(self):
         with pytest.raises(ValueError, match="max_completion_tokens must be a positive integer"):
@@ -722,7 +722,7 @@ class TestAddDocuments:
             store._run_kg_pipeline(chunks, MagicMock(), perform_entity_resolution=False)
 
         assert (
-            "Starting entity extraction for 2 chunks in 1 batch (batch_size=2, max_concurrent=4, collection=ai4rag_col)."
+            "Starting entity extraction for 2 chunks in 2 batches (batch_size=1, max_concurrent=4, collection=ai4rag_col)."
             in caplog.messages
         )
         assert "Finished entity extraction for 2 chunks (collection=ai4rag_col)." in caplog.messages
