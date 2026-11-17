@@ -7,9 +7,10 @@
 import asyncio
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from threading import Lock
 from time import perf_counter
 from typing import Any, Iterator
@@ -70,34 +71,51 @@ KG_MAX_RELATIONSHIPS_PER_CHUNK = 6
 # Qwen model does not reliably honour strict JSON Schema mode. The detailed
 # prompt and local validation retain the application contract without repeatedly
 # retrying an unsupported response-format capability.
+_KG_BATCH_ARGUMENTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "chunks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "chunk_id": {"type": "string"},
+                    "nodes": {"type": "array"},
+                    "relationships": {"type": "array"},
+                },
+                "required": ["chunk_id", "nodes", "relationships"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["chunks"],
+    "additionalProperties": False,
+}
 KG_BATCH_RESPONSE_FORMAT = {"type": "json_object"}
 KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
         "name": "kg_batch",
         "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "chunks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "chunk_id": {"type": "string"},
-                            "nodes": {"type": "array"},
-                            "relationships": {"type": "array"},
-                        },
-                        "required": ["chunk_id", "nodes", "relationships"],
-                        "additionalProperties": False,
-                    },
-                }
-            },
-            "required": ["chunks"],
-            "additionalProperties": False,
-        },
+        "schema": _KG_BATCH_ARGUMENTS_SCHEMA,
     },
 }
+# Tool-calling mode moves the response contract out of the prompt and lets the
+# serving stack parse the payload. vLLM deployments must run with
+# ``--enable-auto-tool-choice`` and a matching ``--tool-call-parser``.
+KG_BATCH_TOOL_NAME = "emit_kg_batch"
+KG_BATCH_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": KG_BATCH_TOOL_NAME,
+        "description": "Record the entities and relationships extracted from every input chunk.",
+        "parameters": _KG_BATCH_ARGUMENTS_SCHEMA,
+    },
+}
+# Name the function explicitly instead of using ``required``: vLLM's Hermes
+# parser supports a forced function name across versions more consistently.
+KG_BATCH_TOOL_CHOICE = {"type": "function", "function": {"name": KG_BATCH_TOOL_NAME}}
+_KG_RESPONSE_FORMATS = frozenset({"json_object", "json_schema", "tools"})
 
 # GraphRAG's lexical nodes are temporary: _CanonicalKGWriter discards them in
 # favor of the canonical nodes already stored by add_documents. Keep their
@@ -152,8 +170,8 @@ def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, A
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("kg_extraction_config.batch_size must be a positive integer.")
     response_format = config.get("response_format", "json_object")
-    if response_format not in {"json_object", "json_schema"}:
-        raise ValueError("kg_extraction_config.response_format must be 'json_object' or 'json_schema'.")
+    if response_format not in _KG_RESPONSE_FORMATS:
+        raise ValueError("kg_extraction_config.response_format must be 'json_object', 'json_schema', or 'tools'.")
     max_skipped_chunks = config.get("max_skipped_chunks", 0)
     if isinstance(max_skipped_chunks, bool) or not isinstance(max_skipped_chunks, int) or max_skipped_chunks < 0:
         raise ValueError("kg_extraction_config.max_skipped_chunks must be a non-negative integer.")
@@ -235,6 +253,63 @@ class _EmbedderAdapter(_NeoEmbedder):  # type: ignore[misc]
             return self._model_calls, self._cache_hits, self._elapsed_seconds
 
 
+def _kg_response_message(response: Any) -> Any:
+    """Return the assistant message carried by a chat-completion choice or message."""
+    if isinstance(response, Mapping):
+        message = response.get("message")
+        return message if message is not None else response
+    message = getattr(response, "message", None)
+    return message if message is not None else response
+
+
+def _kg_message_content(message: Any) -> str:
+    """Return a message's textual content, treating tool-only messages as empty."""
+    content = message.get("content") if isinstance(message, Mapping) else getattr(message, "content", None)
+    return content if isinstance(content, str) else ""
+
+
+def _kg_tool_call_arguments(message: Any, tool_name: str | None) -> str | None:
+    """Return non-empty tool-call arguments, preferring the requested function name."""
+    raw_calls = message.get("tool_calls") if isinstance(message, Mapping) else getattr(message, "tool_calls", None)
+    if not raw_calls:
+        return None
+    candidates: list[tuple[str | None, str]] = []
+    for call in raw_calls:
+        function = call.get("function") if isinstance(call, Mapping) else getattr(call, "function", None)
+        if function is None:
+            continue
+        name = function.get("name") if isinstance(function, Mapping) else getattr(function, "name", None)
+        arguments = function.get("arguments") if isinstance(function, Mapping) else getattr(function, "arguments", None)
+        if isinstance(arguments, str) and arguments.strip():
+            candidates.append((name if isinstance(name, str) else None, arguments))
+    for name, arguments in candidates:
+        if tool_name is None or name == tool_name:
+            return arguments
+    return candidates[0][1] if candidates else None
+
+
+@dataclass(frozen=True)
+class _ToolContract:
+    """OpenAI-compatible tool-calling settings for one adapter."""
+
+    definition: Mapping[str, Any]
+    choice: Mapping[str, Any] | str | None = None
+
+    @property
+    def name(self) -> str | None:
+        """Return the declared function name, when present."""
+        function = self.definition.get("function")
+        name = function.get("name") if isinstance(function, Mapping) else None
+        return name if isinstance(name, str) else None
+
+    def request_kwargs(self) -> dict[str, Any]:
+        """Return the request fields that enable the declared tool."""
+        kwargs: dict[str, Any] = {"tools": [self.definition]}
+        if self.choice is not None:
+            kwargs["tool_choice"] = self.choice
+        return kwargs
+
+
 class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
     """Wraps :class:`BaseFoundationModel` to satisfy ``neo4j_graphrag``'s LLM interface.
 
@@ -248,15 +323,29 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         model: BaseFoundationModel,
         max_completion_tokens: int | None = None,
         response_format: Mapping[str, Any] | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_choice: Mapping[str, Any] | str | None = None,
     ) -> None:
         super().__init__(model_name=model.model_id)
         self._model = model
         self._max_completion_tokens = max_completion_tokens
         self._response_format = dict(response_format) if response_format is not None else None
+        self._tool_contract = self._build_tool_contract(tools, tool_choice)
         self._calls = 0
         self._elapsed_seconds = 0.0
         self._format_repairs = 0
+        self._tool_call_responses = 0
+        self._tool_call_fallbacks = 0
         self._metrics_lock = Lock()
+
+    @staticmethod
+    def _build_tool_contract(
+        tools: Sequence[Mapping[str, Any]] | None, tool_choice: Mapping[str, Any] | str | None
+    ) -> _ToolContract | None:
+        """Wrap the first declared tool, since one function carries the whole batch."""
+        if not tools:
+            return None
+        return _ToolContract(definition=dict(tools[0]), choice=tool_choice)
 
     def invoke(
         self,
@@ -278,20 +367,57 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         input: list[LLMMessage],  # pylint: disable=redefined-builtin
         max_completion_tokens: int | None = None,
         response_format: Mapping[str, Any] | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_choice: Mapping[str, Any] | str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Make one request using the supplied completion limit."""
-        model_kwargs = dict(kwargs)
-        if max_completion_tokens is not None:
-            model_kwargs["max_completion_tokens"] = max_completion_tokens
-        effective_response_format = response_format if response_format is not None else self._response_format
-        if effective_response_format is not None:
-            model_kwargs["response_format"] = effective_response_format
+        model_kwargs, tool_mode = self._request_kwargs(
+            max_completion_tokens=max_completion_tokens,
+            response_format=response_format,
+            tools=tools,
+            tool_choice=tool_choice,
+            extra=kwargs,
+        )
         started_at = perf_counter()
         response = self._model.chat(input, **model_kwargs)[0]
         with self._metrics_lock:
             self._calls += 1
             self._elapsed_seconds += perf_counter() - started_at
+        self._log_stop_reason(response)
+        content = self._response_content(response, tool_mode=tool_mode)
+        normalised_content = _normalise_kg_response(content)
+        if normalised_content != content:
+            with self._metrics_lock:
+                self._format_repairs += 1
+        return LLMResponse(content=normalised_content)
+
+    def _request_kwargs(
+        self,
+        *,
+        max_completion_tokens: int | None,
+        response_format: Mapping[str, Any] | None,
+        tools: Sequence[Mapping[str, Any]] | None,
+        tool_choice: Mapping[str, Any] | str | None,
+        extra: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Build request fields, preferring tool mode over response_format."""
+        model_kwargs = dict(extra)
+        if max_completion_tokens is not None:
+            model_kwargs["max_completion_tokens"] = max_completion_tokens
+        contract = self._build_tool_contract(tools, tool_choice) if tools is not None else self._tool_contract
+        if contract is not None:
+            # Tool calling and response_format are mutually exclusive request modes;
+            # sending both makes serving stacks reject or silently ignore one of them.
+            model_kwargs.update(contract.request_kwargs())
+            return model_kwargs, True
+        effective_response_format = response_format if response_format is not None else self._response_format
+        if effective_response_format is not None:
+            model_kwargs["response_format"] = effective_response_format
+        return model_kwargs, False
+
+    def _log_stop_reason(self, response: Any) -> None:
+        """Log the model's finish reason without leaking response content."""
         stop_reason = (
             response.get("finish_reason") if isinstance(response, Mapping) else getattr(response, "finish_reason", None)
         )
@@ -300,18 +426,32 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
             self._model.model_id,
             stop_reason if isinstance(stop_reason, (str, int, float)) else "unknown",
         )
-        content = (response["content"] if isinstance(response, Mapping) else response.message.content) or ""
-        normalised_content = _normalise_kg_response(content)
-        if normalised_content != content:
+
+    def _response_content(self, response: Any, *, tool_mode: bool) -> str:
+        """Return tool-call arguments, or message content when no usable call exists."""
+        message = _kg_response_message(response)
+        tool_name = self._tool_contract.name if self._tool_contract is not None else None
+        tool_arguments = _kg_tool_call_arguments(message, tool_name) if tool_mode else None
+        if tool_arguments is not None:
             with self._metrics_lock:
-                self._format_repairs += 1
-        return LLMResponse(content=normalised_content)
+                self._tool_call_responses += 1
+            return tool_arguments
+        if tool_mode:
+            with self._metrics_lock:
+                self._tool_call_fallbacks += 1
+        return _kg_message_content(message)
 
     @property
     def metrics(self) -> tuple[int, float, int]:
         """Return model calls, cumulative duration, and repaired response count."""
         with self._metrics_lock:
             return self._calls, self._elapsed_seconds, self._format_repairs
+
+    @property
+    def tool_call_metrics(self) -> tuple[int, int]:
+        """Return tool-call responses and content fallbacks for tool-enabled requests."""
+        with self._metrics_lock:
+            return self._tool_call_responses, self._tool_call_fallbacks
 
     async def ainvoke(
         self,

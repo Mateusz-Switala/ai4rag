@@ -31,6 +31,9 @@ from ai4rag.rag.vector_store.config import Neo4jConfig
 from ai4rag.rag.vector_store.neo4j_utils import (
     KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT,
     KG_BATCH_RESPONSE_FORMAT,
+    KG_BATCH_TOOL_CHOICE,
+    KG_BATCH_TOOL_DEFINITION,
+    KG_BATCH_TOOL_NAME,
     KG_MAX_ENTITIES_PER_CHUNK,
     KG_MAX_RELATIONSHIPS_PER_CHUNK,
     Neo4jGraphSchema,
@@ -431,15 +434,22 @@ class Neo4jGraphStore(BaseVectorStore):
         pipeline_started_at = perf_counter()
 
         kg_writer = _CanonicalKGWriter(self._driver, self._config.database, self._collection_name)
-        response_format = (
-            KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT
-            if self._kg_extraction_config["response_format"] == "json_schema"
-            else KG_BATCH_RESPONSE_FORMAT
-        )
+        recording_mode = self._kg_extraction_config["response_format"]
+        response_format: Mapping[str, Any] | None
+        tools: list[Mapping[str, Any]] | None
+        tool_choice: Mapping[str, Any] | None
+        if recording_mode == "tools":
+            response_format, tools, tool_choice = None, [KG_BATCH_TOOL_DEFINITION], KG_BATCH_TOOL_CHOICE
+        elif recording_mode == "json_schema":
+            response_format, tools, tool_choice = KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT, None, None
+        else:
+            response_format, tools, tool_choice = KG_BATCH_RESPONSE_FORMAT, None, None
         llm = _LLMAdapter(
             model,
             max_completion_tokens=self._kg_extraction_config["max_completion_tokens"],
             response_format=response_format,
+            tools=tools,
+            tool_choice=tool_choice,
         )
 
         async def _run_all() -> None:
@@ -552,6 +562,14 @@ class Neo4jGraphStore(BaseVectorStore):
             llm_format_repairs,
             kg_writer.write_elapsed_seconds,
         )
+        if self._kg_extraction_config["response_format"] == "tools":
+            tool_calls, content_fallbacks = llm.tool_call_metrics
+            logger.info(
+                "KG tool-call responses for collection=%s: %d tool calls, %d content fallbacks.",
+                self._collection_name,
+                tool_calls,
+                content_fallbacks,
+            )
         logger.info(
             "KG extraction and batched graph persistence completed in %.2fs (collection=%s).",
             perf_counter() - pipeline_started_at,
@@ -578,6 +596,28 @@ class Neo4jGraphStore(BaseVectorStore):
             max_entities = self._kg_extraction_config["max_entities_per_chunk"]
             max_relationships = self._kg_extraction_config["max_relationships_per_chunk"]
         payload = [{"chunk_id": chunk.chunk_id, "text": chunk.text} for chunk in chunks]
+        if self._kg_extraction_config["response_format"] == "tools":
+            contract = (
+                f"Report the result by calling the `{KG_BATCH_TOOL_NAME}` function with one entry per input chunk. "
+                "Every input chunk_id must appear exactly once, including chunks with no entities (empty arrays).\n"
+            )
+        else:
+            contract = (
+                "Return only this JSON object, with exactly this structure:\n"
+                + '{"chunks":[{"chunk_id":"input chunk ID","nodes":[{"id":"local ID","label":"type",'
+                + '"properties":{"name":"entity name"}}],"relationships":[{"start_node_id":"local ID",'
+                + '"end_node_id":"local ID","type":"RELATIONSHIP","properties":{}}]}]}\n'
+                + "Every input chunk_id must appear exactly once, including chunks with no entities (empty arrays).\n"
+                + "Examples (format only; do not copy their facts or IDs):\n"
+                + 'Input: [{"chunk_id":"example-relationship","text":"Ada created Atlas."}]\n'
+                + 'Output: {"chunks":[{"chunk_id":"example-relationship","nodes":['
+                + '{"id":"n1","label":"Person","properties":{"name":"Ada"}},'
+                + '{"id":"n2","label":"Product","properties":{"name":"Atlas"}}],'
+                + '"relationships":[{"start_node_id":"n2","end_node_id":"n1",'
+                + '"type":"CREATED_BY","properties":{}}]}]}\n'
+                + 'Input: [{"chunk_id":"example-empty","text":"The and if or but."}]\n'
+                + 'Output: {"chunks":[{"chunk_id":"example-empty","nodes":[],"relationships":[]}]}\n'
+            )
         return (
             "Extract a knowledge graph independently for every input chunk. "
             "Never create relationships between different chunk_id values. "
@@ -586,22 +626,7 @@ class Neo4jGraphStore(BaseVectorStore):
             f"{max_relationships} relationships. Node properties must contain only "
             "the entity name. Relationship properties must be empty. When the selected "
             "schema requires an entity or relationship description, generate a concise, factual description "
-            "of no more than 12 words.\n"
-            "Return only this JSON object, with exactly this structure:\n"
-            + '{"chunks":[{"chunk_id":"input chunk ID","nodes":[{"id":"local ID","label":"type",'
-            + '"properties":{"name":"entity name"}}],"relationships":[{"start_node_id":"local ID",'
-            + '"end_node_id":"local ID","type":"RELATIONSHIP","properties":{}}]}]}\n'
-            "Every input chunk_id must appear exactly once, including chunks with no entities (empty arrays).\n"
-            "Examples (format only; do not copy their facts or IDs):\n"
-            'Input: [{"chunk_id":"example-relationship","text":"Ada created Atlas."}]\n'
-            'Output: {"chunks":[{"chunk_id":"example-relationship","nodes":['
-            '{"id":"n1","label":"Person","properties":{"name":"Ada"}},'
-            '{"id":"n2","label":"Product","properties":{"name":"Atlas"}}],'
-            '"relationships":[{"start_node_id":"n2","end_node_id":"n1",'
-            '"type":"CREATED_BY","properties":{}}]}]}\n'
-            'Input: [{"chunk_id":"example-empty","text":"The and if or but."}]\n'
-            'Output: {"chunks":[{"chunk_id":"example-empty","nodes":[],"relationships":[]}]}\n'
-            f"Input chunks:\n{json.dumps(payload)}"
+            "of no more than 12 words.\n" + contract + f"Input chunks:\n{json.dumps(payload)}"
         )
 
     @staticmethod

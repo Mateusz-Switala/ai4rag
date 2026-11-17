@@ -24,6 +24,9 @@ from ai4rag.rag.vector_store.neo4j import (
 from ai4rag.rag.vector_store.neo4j_utils import (
     _KG_LEXICAL_GRAPH_CONFIG,
     KG_BATCH_RESPONSE_FORMAT,
+    KG_BATCH_TOOL_CHOICE,
+    KG_BATCH_TOOL_DEFINITION,
+    KG_BATCH_TOOL_NAME,
     KG_MAX_ENTITIES_PER_CHUNK,
     KG_MAX_RELATIONSHIPS_PER_CHUNK,
     _build_graph_retrieval_query,
@@ -122,6 +125,93 @@ def test_llm_adapter_requests_a_json_object_response():
     model.chat.assert_called_once_with(
         [{"role": "user", "content": "Extract entities."}], response_format=KG_BATCH_RESPONSE_FORMAT
     )
+
+
+def _tool_call_response(arguments, name=KG_BATCH_TOOL_NAME, content=None):
+    """Build a chat-completion choice that carries one tool call."""
+    return SimpleNamespace(
+        finish_reason="tool_calls",
+        message=SimpleNamespace(
+            content=content,
+            tool_calls=[SimpleNamespace(function=SimpleNamespace(name=name, arguments=arguments))],
+        ),
+    )
+
+
+def test_llm_adapter_sends_the_tool_contract_and_reads_arguments():
+    """Tool mode replaces response_format and parses the tool-call arguments."""
+    model = MagicMock(model_id="test-model")
+    model.chat.return_value = [_tool_call_response('{"chunks": []}')]
+    adapter = _LLMAdapter(
+        model,
+        response_format=KG_BATCH_RESPONSE_FORMAT,
+        tools=[KG_BATCH_TOOL_DEFINITION],
+        tool_choice=KG_BATCH_TOOL_CHOICE,
+    )
+
+    response = adapter.invoke([{"role": "user", "content": "Extract entities."}])
+
+    assert json.loads(response.content) == {"chunks": []}
+    assert adapter.tool_call_metrics == (1, 0)
+    model.chat.assert_called_once_with(
+        [{"role": "user", "content": "Extract entities."}],
+        tools=[KG_BATCH_TOOL_DEFINITION],
+        tool_choice=KG_BATCH_TOOL_CHOICE,
+    )
+
+
+def test_llm_adapter_falls_back_to_content_when_no_tool_call_is_returned():
+    """A model that answers in prose must not lose its payload in tool mode."""
+    model = MagicMock(model_id="test-model")
+    model.chat.return_value = [
+        SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"chunks": []}', tool_calls=None))
+    ]
+    adapter = _LLMAdapter(model, tools=[KG_BATCH_TOOL_DEFINITION], tool_choice=KG_BATCH_TOOL_CHOICE)
+
+    response = adapter.invoke([{"role": "user", "content": "Extract entities."}])
+
+    assert json.loads(response.content) == {"chunks": []}
+    assert adapter.tool_call_metrics == (0, 1)
+
+
+def test_llm_adapter_ignores_blank_tool_arguments():
+    """Empty arguments are a truncated response, so the content fallback applies."""
+    model = MagicMock(model_id="test-model")
+    model.chat.return_value = [_tool_call_response("   ", content='{"chunks": []}')]
+    adapter = _LLMAdapter(model, tools=[KG_BATCH_TOOL_DEFINITION], tool_choice=KG_BATCH_TOOL_CHOICE)
+
+    response = adapter.invoke([{"role": "user", "content": "Extract entities."}])
+
+    assert json.loads(response.content) == {"chunks": []}
+    assert adapter.tool_call_metrics == (0, 1)
+
+
+def test_llm_adapter_prefers_the_declared_tool_name():
+    """Only the requested function is trusted when the model returns several calls."""
+    model = MagicMock(model_id="test-model")
+    model.chat.return_value = [
+        SimpleNamespace(
+            finish_reason="tool_calls",
+            message=SimpleNamespace(
+                content=None,
+                tool_calls=[
+                    SimpleNamespace(function=SimpleNamespace(name="other_tool", arguments='{"chunks": []}')),
+                    SimpleNamespace(
+                        function=SimpleNamespace(
+                            name=KG_BATCH_TOOL_NAME,
+                            arguments='{"chunks": [{"chunk_id": "a", "nodes": [], "relationships": []}]}',
+                        )
+                    ),
+                ],
+            ),
+        )
+    ]
+    adapter = _LLMAdapter(model, tools=[KG_BATCH_TOOL_DEFINITION], tool_choice=KG_BATCH_TOOL_CHOICE)
+
+    response = adapter.invoke([{"role": "user", "content": "Extract entities."}])
+
+    assert json.loads(response.content)["chunks"][0]["chunk_id"] == "a"
+    assert adapter.tool_call_metrics == (1, 0)
 
 
 def test_llm_adapter_logs_the_kg_response_stop_reason(caplog):
@@ -287,6 +377,13 @@ class TestKGExtractionConfig:
     def test_rejects_boolean_completion_limit(self):
         with pytest.raises(ValueError, match="max_completion_tokens must be a positive integer"):
             _validate_kg_extraction_config({"max_completion_tokens": True})
+
+    def test_accepts_the_tools_response_format(self):
+        assert _validate_kg_extraction_config({"response_format": "tools"})["response_format"] == "tools"
+
+    def test_rejects_an_unknown_response_format(self):
+        with pytest.raises(ValueError, match="response_format must be 'json_object', 'json_schema', or 'tools'"):
+            _validate_kg_extraction_config({"response_format": "xml"})
 
     def test_constrained_mode_uses_the_fixed_schema(self):
         options = _kg_pipeline_extraction_options(_validate_kg_extraction_config({"mode": "constrained"}))
@@ -700,6 +797,53 @@ class TestAddDocuments:
             store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
 
         assert request_sizes == [2, 1]
+
+    def test_kg_pipeline_configures_the_tool_response_mode(self, mock_driver_cls, mock_embedding, neo4j_config):
+        """The tools response format reaches the adapter without a response_format."""
+        store = Neo4jGraphStore(
+            mock_embedding,
+            neo4j_config,
+            collection_name="ai4rag_col",
+            kg_extraction_config={"response_format": "tools", "batch_size": 2},
+        )
+        captured: dict = {}
+
+        class RecordingAdapter(_LLMAdapter):
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        with patch("ai4rag.rag.vector_store.neo4j._LLMAdapter", RecordingAdapter):
+            store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
+
+        assert captured["tools"] == [KG_BATCH_TOOL_DEFINITION]
+        assert captured["tool_choice"] == KG_BATCH_TOOL_CHOICE
+        assert captured["response_format"] is None
+
+    def test_kg_batch_prompt_uses_the_tool_contract(self, mock_driver_cls, mock_embedding, neo4j_config):
+        """Tool mode drops the inline JSON example block from the prompt."""
+        store = Neo4jGraphStore(
+            mock_embedding,
+            neo4j_config,
+            collection_name="ai4rag_col",
+            kg_extraction_config={"response_format": "tools"},
+        )
+
+        prompt = store._build_kg_batch_prompt(self._make_chunks(1))
+
+        assert f"`{KG_BATCH_TOOL_NAME}` function" in prompt
+        assert "Examples (format only" not in prompt
+        assert "Input chunks:" in prompt
+
+    def test_kg_batch_prompt_keeps_the_json_contract_for_json_object_mode(
+        self, mock_driver_cls, mock_embedding, neo4j_config
+    ):
+        store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
+
+        prompt = store._build_kg_batch_prompt(self._make_chunks(1))
+
+        assert "Return only this JSON object" in prompt
+        assert "Examples (format only" in prompt
 
     def test_kg_pipeline_ignores_a_failed_single_chunk_by_default(
         self, mock_driver_cls, mock_embedding, neo4j_config, caplog
