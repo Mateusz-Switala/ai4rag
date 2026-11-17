@@ -63,7 +63,7 @@ _CONSTRAINED_KG_RELATIONS = ("RELATED_TO", "PART_OF", "LOCATED_IN", "BELONGS_TO"
 # Keep KG extraction requests short enough to avoid gateway timeouts for
 # constrained graph generation.
 DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 1024
-DEFAULT_KG_EXTRACTION_BATCH_SIZE = 1
+DEFAULT_KG_EXTRACTION_BATCH_SIZE = 2
 KG_MAX_ENTITIES_PER_CHUNK = 6
 KG_MAX_RELATIONSHIPS_PER_CHUNK = 6
 # MaaS' OpenAI-compatible endpoint accepts JSON-object mode, but the deployed

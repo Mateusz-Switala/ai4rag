@@ -418,10 +418,12 @@ class Neo4jGraphStore(BaseVectorStore):
 
         batch_size = self._kg_extraction_config["batch_size"]
         batches = [chunks[index : index + batch_size] for index in range(0, len(chunks), batch_size)]
+        batch_label = "batch" if len(batches) == 1 else "batches"
         logger.info(
-            "Starting entity extraction for %d chunks in %d batches (batch_size=%d, max_concurrent=%d, collection=%s).",
+            "Starting entity extraction for %d chunks in %d %s (batch_size=%d, max_concurrent=%d, collection=%s).",
             len(chunks),
             len(batches),
+            batch_label,
             batch_size,
             max_concurrent,
             self._collection_name,
