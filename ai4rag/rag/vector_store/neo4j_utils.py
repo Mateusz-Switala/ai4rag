@@ -5,14 +5,16 @@
 """Private adapters and helpers used by `ai4rag.rag.vector_store.neo4j`."""
 
 import asyncio
+import copy
 import hashlib
 import json
+import random
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import Lock
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Iterator
 
 import neo4j
@@ -25,6 +27,7 @@ from neo4j_graphrag.llm.base import LLMInterfaceV2 as _NeoLLMInterface
 from neo4j_graphrag.llm.types import LLMResponse
 from neo4j_graphrag.neo4j_queries import db_cleaning_query
 from neo4j_graphrag.types import LLMMessage
+from openai import APIConnectionError, OpenAI
 
 from ai4rag import logger
 from ai4rag.rag.embedding.base_model import BaseEmbeddingModel
@@ -67,8 +70,21 @@ DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 1024
 # One chunk per request keeps each response inside the completion limit, so a
 # truncated batch cannot turn into singleton retries mid-extraction.
 DEFAULT_KG_EXTRACTION_BATCH_SIZE = 1
+# SDK retries cover short-lived blips; these application-level retries absorb
+# gateway rate-limit windows and transient 5xx responses between them.
+DEFAULT_KG_LLM_MAX_RETRIES = 4
+DEFAULT_KG_LLM_RETRY_BASE_SECONDS = 1.0
+# KG extraction owns the retry policy end to end. Leaving the OpenAI SDK's own
+# retries enabled would multiply both layers (5 requests x 3 attempts) and hide
+# those attempts from the metrics and the rate-limit breaker.
+DEFAULT_KG_LLM_SDK_MAX_RETRIES = 0
+# Abort instead of issuing hundreds of futile requests once the endpoint clearly
+# rejects everything, e.g. when the model subscription token quota is exhausted.
+DEFAULT_KG_RATE_LIMIT_BREAKER_THRESHOLD = 12
+KG_LLM_RETRY_MAX_BACKOFF_SECONDS = 60.0
 KG_MAX_ENTITIES_PER_CHUNK = 6
 KG_MAX_RELATIONSHIPS_PER_CHUNK = 6
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429})
 # MaaS' OpenAI-compatible endpoint accepts JSON-object mode, but the deployed
 # Qwen model does not reliably honour strict JSON Schema mode. The detailed
 # prompt and local validation retain the application contract without repeatedly
@@ -144,7 +160,75 @@ def _collection_vector_index_name(collection_name: str) -> str:
     return f"{collection_name}__embedding"
 
 
-def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, Any]:
+def _http_status_code(error: BaseException) -> int | None:
+    """Return the HTTP status carried by an SDK or provider exception, when present."""
+    status = getattr(error, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = getattr(getattr(error, "response", None), "status_code", None)
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
+def _retry_after_seconds(error: BaseException) -> float | None:
+    """Return the provider's numeric ``Retry-After`` hint, when one is present."""
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    try:
+        value = headers.get("retry-after") if headers is not None else None
+        seconds = float(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return max(0.0, seconds)
+
+
+def is_rate_limit_llm_error(error: BaseException) -> bool:
+    """Return whether *error* is a provider-side rate limit (HTTP 429)."""
+    return _http_status_code(error) == 429
+
+
+def is_retryable_llm_error(error: BaseException) -> bool:
+    """Return whether a failed LLM call is worth retrying.
+
+    Rate limits, transient server errors, and transport failures are retryable;
+    client errors such as a malformed request are not.
+    """
+    if isinstance(error, APIConnectionError):
+        return True
+    status = _http_status_code(error)
+    if status is None:
+        return False
+    return status in _RETRYABLE_HTTP_STATUS_CODES or status >= 500
+
+
+def kg_retry_delay_seconds(attempt: int, error: BaseException, base_seconds: float) -> float:
+    """Return the backoff before retrying a KG request.
+
+    A numeric ``Retry-After`` header takes precedence, capped at
+    :data:`KG_LLM_RETRY_MAX_BACKOFF_SECONDS`. Otherwise the delay grows
+    exponentially with jitter so concurrent workers do not retry in lockstep.
+    """
+    retry_after = _retry_after_seconds(error)
+    if retry_after is not None:
+        return min(retry_after, KG_LLM_RETRY_MAX_BACKOFF_SECONDS)
+    ceiling = min(base_seconds * (2**attempt), KG_LLM_RETRY_MAX_BACKOFF_SECONDS)
+    return random.uniform(base_seconds * 0.5, ceiling)
+
+
+def _model_with_sdk_retries(model: BaseFoundationModel, retries: int) -> BaseFoundationModel:
+    """Return a shallow model view whose OpenAI client uses *retries* SDK retries.
+
+    The original model is left untouched because generation shares the same
+    instance. Models without an OpenAI client are returned unchanged.
+    """
+    client = getattr(model, "client", None)
+    if not isinstance(client, OpenAI):
+        return model
+    view = copy.copy(model)
+    view.client = client.with_options(max_retries=retries)
+    return view
+
+
+def _validate_kg_extraction_config(  # pylint: disable=too-many-branches
+    config: dict[str, Any] | None,
+) -> dict[str, Any]:
     """Validate KG extraction settings and apply the constrained default."""
     if config is None:
         return {
@@ -154,6 +238,10 @@ def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, A
             "response_format": "json_object",
             "max_skipped_chunks": 0,
             "partial_failure_policy": "degrade",
+            "max_retries": DEFAULT_KG_LLM_MAX_RETRIES,
+            "retry_base_seconds": DEFAULT_KG_LLM_RETRY_BASE_SECONDS,
+            "sdk_max_retries": DEFAULT_KG_LLM_SDK_MAX_RETRIES,
+            "rate_limit_breaker_threshold": DEFAULT_KG_RATE_LIMIT_BREAKER_THRESHOLD,
         }
     if not isinstance(config, dict):
         raise TypeError("kg_extraction_config must be a dictionary or None.")
@@ -180,6 +268,26 @@ def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, A
     partial_failure_policy = config.get("partial_failure_policy", "degrade")
     if partial_failure_policy not in {"degrade", "raise"}:
         raise ValueError("kg_extraction_config.partial_failure_policy must be 'degrade' or 'raise'.")
+    max_retries = config.get("max_retries", DEFAULT_KG_LLM_MAX_RETRIES)
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+        raise ValueError("kg_extraction_config.max_retries must be a non-negative integer.")
+    retry_base_seconds = config.get("retry_base_seconds", DEFAULT_KG_LLM_RETRY_BASE_SECONDS)
+    if (
+        isinstance(retry_base_seconds, bool)
+        or not isinstance(retry_base_seconds, (int, float))
+        or retry_base_seconds <= 0
+    ):
+        raise ValueError("kg_extraction_config.retry_base_seconds must be a positive number.")
+    sdk_max_retries = config.get("sdk_max_retries", DEFAULT_KG_LLM_SDK_MAX_RETRIES)
+    if isinstance(sdk_max_retries, bool) or not isinstance(sdk_max_retries, int) or sdk_max_retries < 0:
+        raise ValueError("kg_extraction_config.sdk_max_retries must be a non-negative integer.")
+    rate_limit_breaker_threshold = config.get("rate_limit_breaker_threshold", DEFAULT_KG_RATE_LIMIT_BREAKER_THRESHOLD)
+    if (
+        isinstance(rate_limit_breaker_threshold, bool)
+        or not isinstance(rate_limit_breaker_threshold, int)
+        or rate_limit_breaker_threshold < 1
+    ):
+        raise ValueError("kg_extraction_config.rate_limit_breaker_threshold must be a positive integer.")
     common = {
         "mode": mode,
         "max_completion_tokens": max_completion_tokens,
@@ -187,6 +295,10 @@ def _validate_kg_extraction_config(config: dict[str, Any] | None) -> dict[str, A
         "response_format": response_format,
         "max_skipped_chunks": max_skipped_chunks,
         "partial_failure_policy": partial_failure_policy,
+        "max_retries": max_retries,
+        "retry_base_seconds": float(retry_base_seconds),
+        "sdk_max_retries": sdk_max_retries,
+        "rate_limit_breaker_threshold": rate_limit_breaker_threshold,
     }
     if mode == "constrained":
         return common
@@ -312,12 +424,14 @@ class _ToolContract:
         return kwargs
 
 
-class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
+class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]  # pylint: disable=too-many-instance-attributes
     """Wraps :class:`BaseFoundationModel` to satisfy ``neo4j_graphrag``'s LLM interface.
 
     Implements GraphRAG's V2 list-of-messages contract and bridges the sync
     :meth:`BaseFoundationModel.chat` via a worker thread. Response JSON is
     normalised for common, schema-compatible model variants before parsing.
+    The adapter owns the retry policy: the OpenAI client is wrapped so its own
+    retries do not stack on top of :meth:`_chat_with_retries`.
     """
 
     def __init__(
@@ -327,15 +441,32 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         response_format: Mapping[str, Any] | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
         tool_choice: Mapping[str, Any] | str | None = None,
+        max_retries: int = DEFAULT_KG_LLM_MAX_RETRIES,
+        retry_base_seconds: float = DEFAULT_KG_LLM_RETRY_BASE_SECONDS,
+        sdk_max_retries: int = DEFAULT_KG_LLM_SDK_MAX_RETRIES,
     ) -> None:
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError("max_retries must be a non-negative integer.")
+        if (
+            isinstance(retry_base_seconds, bool)
+            or not isinstance(retry_base_seconds, (int, float))
+            or retry_base_seconds <= 0
+        ):
+            raise ValueError("retry_base_seconds must be a positive number.")
+        if isinstance(sdk_max_retries, bool) or not isinstance(sdk_max_retries, int) or sdk_max_retries < 0:
+            raise ValueError("sdk_max_retries must be a non-negative integer.")
         super().__init__(model_name=model.model_id)
-        self._model = model
+        self._model = _model_with_sdk_retries(model, sdk_max_retries)
         self._max_completion_tokens = max_completion_tokens
         self._response_format = dict(response_format) if response_format is not None else None
         self._tool_contract = self._build_tool_contract(tools, tool_choice)
+        self._max_retries = max_retries
+        self._retry_base_seconds = float(retry_base_seconds)
         self._calls = 0
         self._elapsed_seconds = 0.0
         self._format_repairs = 0
+        self._retries = 0
+        self._failed_calls = 0
         self._tool_call_responses = 0
         self._tool_call_fallbacks = 0
         self._metrics_lock = Lock()
@@ -382,7 +513,7 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
             extra=kwargs,
         )
         started_at = perf_counter()
-        response = self._model.chat(input, **model_kwargs)[0]
+        response = self._chat_with_retries(input, model_kwargs)
         with self._metrics_lock:
             self._calls += 1
             self._elapsed_seconds += perf_counter() - started_at
@@ -393,6 +524,39 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
             with self._metrics_lock:
                 self._format_repairs += 1
         return LLMResponse(content=normalised_content)
+
+    def _chat_with_retries(  # pylint: disable=redefined-builtin
+        self, input: list[LLMMessage], model_kwargs: Mapping[str, Any]
+    ) -> Any:
+        """Call the model, retrying rate limits and transient failures with backoff.
+
+        Retries happen in the calling worker thread, so blocking sleep does not
+        stall the event loop that awaits :meth:`ainvoke`.
+        """
+        attempts = self._max_retries + 1
+        for attempt in range(attempts):
+            try:
+                return self._model.chat(input, **model_kwargs)[0]
+            except Exception as exc:  # pylint: disable=broad-except
+                if attempt + 1 >= attempts or not is_retryable_llm_error(exc):
+                    with self._metrics_lock:
+                        self._failed_calls += 1
+                    raise
+                delay = kg_retry_delay_seconds(attempt, exc, self._retry_base_seconds)
+                with self._metrics_lock:
+                    self._retries += 1
+                logger.warning(
+                    "KG extraction LLM request failed with %s (status=%s); retrying in %.1fs "
+                    "(attempt %d/%d, model=%s).",
+                    type(exc).__name__,
+                    _http_status_code(exc),
+                    delay,
+                    attempt + 1,
+                    attempts,
+                    self._model.model_id,
+                )
+                sleep(delay)
+        raise RuntimeError("KG extraction retry loop exited without a response.")
 
     def _request_kwargs(
         self,
@@ -448,6 +612,12 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]
         """Return model calls, cumulative duration, and repaired response count."""
         with self._metrics_lock:
             return self._calls, self._elapsed_seconds, self._format_repairs
+
+    @property
+    def retry_metrics(self) -> tuple[int, int]:
+        """Return the number of retried requests and requests that exhausted retries."""
+        with self._metrics_lock:
+            return self._retries, self._failed_calls
 
     @property
     def tool_call_metrics(self) -> tuple[int, int]:

@@ -44,6 +44,7 @@ from ai4rag.rag.vector_store.neo4j_utils import (
     _LLMAdapter,
     _validate_kg_extraction_config,
     _validate_neo4j_search_params,
+    is_rate_limit_llm_error,
 )
 from ai4rag.rag.vector_store.utils import (
     iter_unique_chunks,
@@ -94,6 +95,10 @@ class _KGResponseFormatError(ValueError):
 
 class _KGExtractionDegradedError(RuntimeError):
     """KG extraction exceeded the caller's tolerated partial-failure budget."""
+
+
+class _KGExtractionRateLimitedError(_KGExtractionDegradedError):
+    """The endpoint rejected KG extraction requests until the breaker tripped."""
 
 
 def _is_malformed_kg_batch_response(error: Exception) -> bool:
@@ -450,18 +455,56 @@ class Neo4jGraphStore(BaseVectorStore):
             response_format=response_format,
             tools=tools,
             tool_choice=tool_choice,
+            max_retries=self._kg_extraction_config["max_retries"],
+            retry_base_seconds=self._kg_extraction_config["retry_base_seconds"],
+            sdk_max_retries=self._kg_extraction_config["sdk_max_retries"],
         )
 
-        async def _run_all() -> None:
+        async def _run_all() -> None:  # pylint: disable=too-many-locals,too-many-statements
             sem = asyncio.Semaphore(max_concurrent)
             extracted_graphs: list[tuple[str, Neo4jGraph]] = []
             extracted_graphs_lock = asyncio.Lock()
             skipped_chunk_ids: list[str] = []
             skipped_chunks_lock = asyncio.Lock()
+            consecutive_rate_limits = 0
+            rate_limit_lock = asyncio.Lock()
+            rate_limit_breaker = asyncio.Event()
+            breaker_threshold = self._kg_extraction_config["rate_limit_breaker_threshold"]
+
+            async def _record_rate_limit() -> None:
+                """Count an exhausted rate-limited request and trip the breaker at the threshold."""
+                nonlocal consecutive_rate_limits
+                async with rate_limit_lock:
+                    consecutive_rate_limits += 1
+                    tripped = consecutive_rate_limits >= breaker_threshold
+                    if tripped:
+                        rate_limit_breaker.set()
+                if tripped:
+                    self._kg_extraction_degraded = True
+                    raise _KGExtractionRateLimitedError(
+                        f"The foundation-model endpoint rejected {consecutive_rate_limits} consecutive KG "
+                        f"extraction requests for collection={self._collection_name}. Check the model subscription "
+                        "token quota and rate limits, or lower kg_max_concurrent."
+                    )
+
+            async def _record_success() -> None:
+                nonlocal consecutive_rate_limits
+                async with rate_limit_lock:
+                    consecutive_rate_limits = 0
+
+            def _abort_error() -> _KGExtractionRateLimitedError:
+                return _KGExtractionRateLimitedError(
+                    f"KG extraction aborted after the endpoint kept rejecting requests "
+                    f"(collection={self._collection_name})."
+                )
 
             async def _request(batch: list[AI4RAGChunk]):
                 """Issue one request without holding a slot during retry backoff."""
+                if rate_limit_breaker.is_set():
+                    raise _abort_error()
                 async with sem:
+                    if rate_limit_breaker.is_set():
+                        raise _abort_error()
                     return await llm.ainvoke_with_completion_limit(
                         self._build_kg_batch_prompt(batch), self._kg_extraction_config["max_completion_tokens"]
                     )
@@ -471,6 +514,7 @@ class Neo4jGraphStore(BaseVectorStore):
                 pending = batch
                 try:
                     response = await _request(pending)
+                    await _record_success()
                     graphs, missing = self._parse_kg_batch_response(response.content, pending, on_error)
                     async with extracted_graphs_lock:
                         extracted_graphs.extend((chunk.chunk_id, graph) for chunk, graph in graphs)
@@ -499,7 +543,11 @@ class Neo4jGraphStore(BaseVectorStore):
                         pending[0].chunk_id,
                         exc,
                     )
+                except _KGExtractionRateLimitedError:
+                    raise
                 except Exception as exc:  # pylint: disable=broad-except
+                    if is_rate_limit_llm_error(exc):
+                        await _record_rate_limit()
                     if on_error == "RAISE":
                         raise
                     logger.error(
@@ -511,9 +559,24 @@ class Neo4jGraphStore(BaseVectorStore):
                 async with skipped_chunks_lock:
                     skipped_chunk_ids.extend(chunk.chunk_id for chunk in pending)
 
-            await asyncio.gather(*(_process_batch(batch) for batch in batches))
+            tasks = [asyncio.ensure_future(_process_batch(batch)) for batch in batches]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                # The breaker fails the first poisoned batch; stop the rest instead of
+                # letting them keep hammering an endpoint that already rejected us.
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             kg_writer.write_graphs(extracted_graphs)
             skipped_count = len(skipped_chunk_ids)
+            if skipped_count >= len(chunks):
+                self._kg_extraction_degraded = True
+                raise _KGExtractionDegradedError(
+                    f"KG extraction produced no entities for collection={self._collection_name}: "
+                    f"all {len(chunks)} chunks were skipped. Check the foundation-model endpoint and its "
+                    "rate limits before retrying."
+                )
             if skipped_count > self._kg_extraction_config["max_skipped_chunks"]:
                 message = "KG extraction is degraded for collection=%s: skipped %d of %d chunks (allowed=%d)."
                 self._kg_extraction_degraded = True
@@ -554,12 +617,16 @@ class Neo4jGraphStore(BaseVectorStore):
             )
 
         llm_calls, llm_elapsed_seconds, llm_format_repairs = llm.metrics
+        llm_retries, llm_failed_calls = llm.retry_metrics
         logger.info(
-            "KG phases for collection=%s: LLM=%d calls/%.2fs/%d response repairs, " + "graph writes=%.2fs.",
+            "KG phases for collection=%s: LLM=%d calls/%.2fs/%d response repairs/%d retries/%d failed requests, "
+            "graph writes=%.2fs.",
             self._collection_name,
             llm_calls,
             llm_elapsed_seconds,
             llm_format_repairs,
+            llm_retries,
+            llm_failed_calls,
             kg_writer.write_elapsed_seconds,
         )
         if self._kg_extraction_config["response_format"] == "tools":
