@@ -89,7 +89,7 @@ the model's answer-generation parameters. The same config can be passed to
 `AI4RAGExperiment`. `kg_extraction_config.response_format` accepts `json_object`
 (default), `json_schema`, or `tools`; `tools` requires a serving stack with
 OpenAI-compatible tool calling enabled. Entity extraction sends one chunk per
-request by default and processes up to four requests concurrently.
+request by default and processes up to two requests concurrently.
 
 ::: ai4rag.rag.vector_store.neo4j
     options:

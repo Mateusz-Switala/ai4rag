@@ -43,7 +43,6 @@ from ai4rag.rag.vector_store.neo4j_utils import (
     _CanonicalKGWriter,
     _CollectionKGWriter,
     _EmbedderAdapter,
-    _kg_pipeline_extraction_options,
     _LLMAdapter,
     _model_with_sdk_retries,
     _validate_kg_extraction_config,
@@ -395,6 +394,7 @@ class TestKGExtractionConfig:
         assert config["retry_base_seconds"] == DEFAULT_KG_LLM_RETRY_BASE_SECONDS
         assert config["sdk_max_retries"] == DEFAULT_KG_LLM_SDK_MAX_RETRIES
         assert config["rate_limit_breaker_threshold"] == DEFAULT_KG_RATE_LIMIT_BREAKER_THRESHOLD
+        assert config["fail_on_empty_kg"] is True
 
     def test_accepts_custom_retry_settings(self):
         config = _validate_kg_extraction_config(
@@ -419,6 +419,7 @@ class TestKGExtractionConfig:
             ({"retry_base_seconds": 0}, "retry_base_seconds must be a positive number"),
             ({"sdk_max_retries": -1}, "sdk_max_retries must be a non-negative integer"),
             ({"rate_limit_breaker_threshold": 0}, "rate_limit_breaker_threshold must be a positive integer"),
+            ({"fail_on_empty_kg": "yes"}, "fail_on_empty_kg must be a boolean"),
         ],
     )
     def test_rejects_invalid_retry_settings(self, config, message):
@@ -429,31 +430,18 @@ class TestKGExtractionConfig:
         with pytest.raises(ValueError, match="max_completion_tokens must be a positive integer"):
             _validate_kg_extraction_config({"max_completion_tokens": True})
 
+    def test_rejects_boolean_free_mode_limits(self):
+        with pytest.raises(ValueError, match="max_entities_per_chunk must be a positive integer"):
+            _validate_kg_extraction_config(
+                {"mode": "free", "max_entities_per_chunk": True, "max_relationships_per_chunk": 5}
+            )
+
     def test_accepts_the_tools_response_format(self):
         assert _validate_kg_extraction_config({"response_format": "tools"})["response_format"] == "tools"
 
     def test_rejects_an_unknown_response_format(self):
         with pytest.raises(ValueError, match="response_format must be 'json_object', 'json_schema', or 'tools'"):
             _validate_kg_extraction_config({"response_format": "xml"})
-
-    def test_constrained_mode_uses_the_fixed_schema(self):
-        options = _kg_pipeline_extraction_options(_validate_kg_extraction_config({"mode": "constrained"}))
-
-        assert "entities" in options
-        assert "relations" in options
-
-    def test_free_mode_skips_schema_extraction_and_caps_each_chunk(self):
-        options = _kg_pipeline_extraction_options(
-            _validate_kg_extraction_config(
-                {"mode": "free", "max_entities_per_chunk": 5, "max_relationships_per_chunk": 5}
-            )
-        )
-
-        assert options["schema"] == "FREE"
-        assert "entities" not in options
-        assert "relations" not in options
-        assert "at most 5 entities" in options["prompt_template"].template
-        assert "at most 5 relationships" in options["prompt_template"].template
 
 
 def test_balanced_graph_query_limits_pivots_hops_and_related_chunks():
@@ -773,7 +761,7 @@ class TestAddDocuments:
             store._run_kg_pipeline(chunks, MagicMock(), perform_entity_resolution=False)
 
         assert (
-            "Starting entity extraction for 2 chunks in 2 batches (batch_size=1, max_concurrent=4, collection=ai4rag_col)."
+            "Starting entity extraction for 2 chunks in 2 batches (batch_size=1, max_concurrent=2, collection=ai4rag_col)."
             in caplog.messages
         )
         assert "Finished entity extraction for 2 chunks (collection=ai4rag_col)." in caplog.messages
@@ -921,6 +909,69 @@ class TestAddDocuments:
         assert "Skipping KG extraction" in caplog.text
         assert store.is_kg_extraction_degraded
 
+    def test_all_skipped_chunks_degrade_when_fail_on_empty_kg_is_disabled(
+        self, mock_driver_cls, mock_embedding, neo4j_config
+    ):
+        """Operators can trade a hard failure for chunks-only indexing."""
+        store = Neo4jGraphStore(
+            mock_embedding,
+            neo4j_config,
+            collection_name="ai4rag_col",
+            kg_extraction_config={"fail_on_empty_kg": False, "max_skipped_chunks": 5},
+        )
+
+        class BadRequest(Exception):
+            status_code = 400
+
+        async def run_pipeline(*_):
+            raise BadRequest("invalid payload")
+
+        with patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline):
+            store._run_kg_pipeline(self._make_chunks(2), MagicMock(), perform_entity_resolution=False)
+
+        assert store.is_kg_extraction_degraded
+
+    def test_breaker_persists_graphs_extracted_before_it_trips(self, mock_driver_cls, mock_embedding, neo4j_config):
+        """A retry must not re-pay for chunks that were already extracted."""
+        store = Neo4jGraphStore(
+            mock_embedding,
+            neo4j_config,
+            collection_name="ai4rag_col",
+            kg_extraction_config={"rate_limit_breaker_threshold": 2},
+        )
+        attempts = 0
+
+        async def run_pipeline(_, prompt, _completion_limit):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                payload = json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1])
+                return SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "chunks": [
+                                {
+                                    "chunk_id": payload[0]["chunk_id"],
+                                    "nodes": [{"id": "n1", "label": "Person", "properties": {"name": "Ada"}}],
+                                    "relationships": [],
+                                }
+                            ]
+                        }
+                    )
+                )
+            raise _HttpStatusError(429)
+
+        writer = MagicMock()
+        with (
+            patch.object(_LLMAdapter, "ainvoke_with_completion_limit", run_pipeline),
+            patch("ai4rag.rag.vector_store.neo4j._CanonicalKGWriter", return_value=writer),
+            pytest.raises(_KGExtractionRateLimitedError),
+        ):
+            store._run_kg_pipeline(self._make_chunks(4), MagicMock(), max_concurrent=1, perform_entity_resolution=False)
+
+        written = writer.write_graphs.call_args.args[0]
+        assert len(written) == 1
+
     def test_pipeline_can_skip_scoped_entity_resolution(self, mock_driver_cls, mock_embedding, neo4j_config):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")
         session = mock_driver_cls.return_value.session.return_value.__enter__.return_value
@@ -1028,6 +1079,30 @@ class TestKGExtractionResilience:
         sleep.assert_not_called()
         assert adapter.retry_metrics == (0, 1)
 
+    def test_adapter_retries_connection_errors(self, _mock_driver_cls):
+        model = MagicMock(model_id="test-model")
+        model.chat.side_effect = [
+            APIConnectionError(request=Request("POST", "http://localhost")),
+            [_chat_choice()],
+        ]
+        adapter = _LLMAdapter(model, max_retries=1, retry_base_seconds=0.01)
+
+        with patch("ai4rag.rag.vector_store.neo4j_utils.sleep"):
+            adapter.invoke([{"role": "user", "content": "hello"}])
+
+        assert model.chat.call_count == 2
+        assert adapter.retry_metrics == (1, 0)
+
+    def test_adapter_counts_every_attempt(self, _mock_driver_cls):
+        model = MagicMock(model_id="test-model")
+        model.chat.side_effect = [_HttpStatusError(429), [_chat_choice()]]
+        adapter = _LLMAdapter(model, max_retries=2, retry_base_seconds=0.01)
+
+        with patch("ai4rag.rag.vector_store.neo4j_utils.sleep"):
+            adapter.invoke([{"role": "user", "content": "hello"}])
+
+        assert adapter.metrics[0] == 2
+
     def test_adapter_reports_exhausted_retries(self, _mock_driver_cls):
         model = MagicMock(model_id="test-model")
         model.chat.side_effect = _HttpStatusError(429)
@@ -1066,6 +1141,19 @@ class TestKGExtractionResilience:
         model = MagicMock(model_id="test-model")
 
         assert _model_with_sdk_retries(model, 0) is model
+
+    def test_model_view_wraps_a_duck_typed_client(self, _mock_driver_cls):
+        class WrappedClient:
+            def with_options(self, **kwargs):
+                self.kwargs = kwargs
+                return self
+
+        model = SimpleNamespace(model_id="test-model", client=WrappedClient())
+
+        view = _model_with_sdk_retries(model, 0)
+
+        assert view is not model
+        assert view.client.kwargs == {"max_retries": 0}
 
     def test_adapter_applies_the_configured_sdk_retries(self, _mock_driver_cls):
         model = MagicMock(model_id="test-model")

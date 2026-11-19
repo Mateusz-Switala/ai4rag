@@ -82,7 +82,6 @@ def _suppress_neo4j_graphrag_info_logs() -> Iterator[None]:
 
 
 _CUSTOM_CA_URI_SCHEMES = {"neo4j+s": "neo4j", "bolt+s": "bolt"}
-_KG_NEO4J_RETRY_ATTEMPTS = 3
 
 
 class _KGResponseFormatError(ValueError):
@@ -183,7 +182,7 @@ class Neo4jGraphStore(BaseVectorStore):
     """
 
     _BATCH_SIZE = 512
-    _DEFAULT_KG_EXTRACTION_CONCURRENCY = 4
+    _DEFAULT_KG_EXTRACTION_CONCURRENCY = 2
     _VECTOR_INDEX_WAIT_SECONDS = 600
 
     def __init__(
@@ -336,7 +335,7 @@ class Neo4jGraphStore(BaseVectorStore):
               omitted and no model was supplied at construction, graph search
               returns ANN seed chunks without entity-based context expansion.
             - ``kg_max_concurrent`` (int) — maximum concurrent KG extraction
-              requests when a foundation model is present (default 4).
+              requests when a foundation model is present (default 2).
         """
         if not documents:
             return
@@ -568,16 +567,23 @@ class Neo4jGraphStore(BaseVectorStore):
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-            kg_writer.write_graphs(extracted_graphs)
+                # Persist what succeeded before surfacing a breaker failure, so a retry
+                # does not re-pay for chunks that were already extracted.
+                kg_writer.write_graphs(extracted_graphs)
             skipped_count = len(skipped_chunk_ids)
             if skipped_count >= len(chunks):
                 self._kg_extraction_degraded = True
-                raise _KGExtractionDegradedError(
+                message = (
                     f"KG extraction produced no entities for collection={self._collection_name}: "
                     f"all {len(chunks)} chunks were skipped. Check the foundation-model endpoint and its "
                     "rate limits before retrying."
                 )
-            if skipped_count > self._kg_extraction_config["max_skipped_chunks"]:
+                if self._kg_extraction_config["fail_on_empty_kg"] or (
+                    self._kg_extraction_config["partial_failure_policy"] == "raise"
+                ):
+                    raise _KGExtractionDegradedError(message)
+                logger.error(message)
+            elif skipped_count > self._kg_extraction_config["max_skipped_chunks"]:
                 message = "KG extraction is degraded for collection=%s: skipped %d of %d chunks (allowed=%d)."
                 self._kg_extraction_degraded = True
                 if self._kg_extraction_config["partial_failure_policy"] == "raise":

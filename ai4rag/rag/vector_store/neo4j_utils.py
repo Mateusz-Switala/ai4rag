@@ -19,15 +19,13 @@ from typing import Any, Iterator
 
 import neo4j
 from neo4j_graphrag.components.kg_writer import KGWriterModel, Neo4jWriter
-from neo4j_graphrag.components.text_splitters.base import TextSplitter
-from neo4j_graphrag.components.types import LexicalGraphConfig, Neo4jGraph, Neo4jRelationship, TextChunk, TextChunks
+from neo4j_graphrag.components.types import LexicalGraphConfig, Neo4jGraph, Neo4jRelationship
 from neo4j_graphrag.embeddings.base import Embedder as _NeoEmbedder
-from neo4j_graphrag.generation.prompts import ERExtractionTemplate
 from neo4j_graphrag.llm.base import LLMInterfaceV2 as _NeoLLMInterface
 from neo4j_graphrag.llm.types import LLMResponse
 from neo4j_graphrag.neo4j_queries import db_cleaning_query
 from neo4j_graphrag.types import LLMMessage
-from openai import APIConnectionError, OpenAI
+from openai import APIConnectionError
 
 from ai4rag import logger
 from ai4rag.rag.embedding.base_model import BaseEmbeddingModel
@@ -62,8 +60,6 @@ class Neo4jGraphSchema:
 _SCHEMA = Neo4jGraphSchema
 
 
-_CONSTRAINED_KG_ENTITIES = ("Person", "Organization", "Place", "Concept", "Event", "Product", "Technology")
-_CONSTRAINED_KG_RELATIONS = ("RELATED_TO", "PART_OF", "LOCATED_IN", "BELONGS_TO", "CREATED_BY", "MENTIONS")
 # Keep KG extraction requests short enough to avoid gateway timeouts for
 # constrained graph generation.
 DEFAULT_KG_EXTRACTION_MAX_COMPLETION_TOKENS = 1024
@@ -144,17 +140,6 @@ _KG_LEXICAL_GRAPH_CONFIG = LexicalGraphConfig(
 )
 
 
-class _PreChunkedTextSplitter(TextSplitter):
-    """Preserve the canonical chunk passed to the KG pipeline as one text chunk."""
-
-    def iter_chunks(self, text: str) -> Iterator[TextChunk]:
-        """Yield the canonical text unchanged as one chunk."""
-        yield TextChunk(text=text, index=0)
-
-    async def run(self, text: str) -> TextChunks:
-        return TextChunks(chunks=[TextChunk(text=text, index=0)])
-
-
 def _collection_vector_index_name(collection_name: str) -> str:
     """Return the vector-index name dedicated to *collection_name*."""
     return f"{collection_name}__embedding"
@@ -216,17 +201,20 @@ def _model_with_sdk_retries(model: BaseFoundationModel, retries: int) -> BaseFou
     """Return a shallow model view whose OpenAI client uses *retries* SDK retries.
 
     The original model is left untouched because generation shares the same
-    instance. Models without an OpenAI client are returned unchanged.
+    instance. Clients without ``with_options`` are returned unchanged. The
+    lookup uses the class rather than the instance so duck-typed wrappers are
+    handled while generic mocks keep passing through.
     """
     client = getattr(model, "client", None)
-    if not isinstance(client, OpenAI):
+    with_options = getattr(type(client), "with_options", None)
+    if not callable(with_options):
         return model
     view = copy.copy(model)
-    view.client = client.with_options(max_retries=retries)
+    view.client = with_options(client, max_retries=retries)
     return view
 
 
-def _validate_kg_extraction_config(  # pylint: disable=too-many-branches
+def _validate_kg_extraction_config(  # pylint: disable=too-many-branches,too-many-locals
     config: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Validate KG extraction settings and apply the constrained default."""
@@ -242,6 +230,7 @@ def _validate_kg_extraction_config(  # pylint: disable=too-many-branches
             "retry_base_seconds": DEFAULT_KG_LLM_RETRY_BASE_SECONDS,
             "sdk_max_retries": DEFAULT_KG_LLM_SDK_MAX_RETRIES,
             "rate_limit_breaker_threshold": DEFAULT_KG_RATE_LIMIT_BREAKER_THRESHOLD,
+            "fail_on_empty_kg": True,
         }
     if not isinstance(config, dict):
         raise TypeError("kg_extraction_config must be a dictionary or None.")
@@ -288,6 +277,9 @@ def _validate_kg_extraction_config(  # pylint: disable=too-many-branches
         or rate_limit_breaker_threshold < 1
     ):
         raise ValueError("kg_extraction_config.rate_limit_breaker_threshold must be a positive integer.")
+    fail_on_empty_kg = config.get("fail_on_empty_kg", True)
+    if not isinstance(fail_on_empty_kg, bool):
+        raise ValueError("kg_extraction_config.fail_on_empty_kg must be a boolean.")
     common = {
         "mode": mode,
         "max_completion_tokens": max_completion_tokens,
@@ -299,6 +291,7 @@ def _validate_kg_extraction_config(  # pylint: disable=too-many-branches
         "retry_base_seconds": float(retry_base_seconds),
         "sdk_max_retries": sdk_max_retries,
         "rate_limit_breaker_threshold": rate_limit_breaker_threshold,
+        "fail_on_empty_kg": fail_on_empty_kg,
     }
     if mode == "constrained":
         return common
@@ -308,30 +301,9 @@ def _validate_kg_extraction_config(  # pylint: disable=too-many-branches
         "max_relationships_per_chunk": config.get("max_relationships_per_chunk"),
     }
     for name, value in limits.items():
-        if not isinstance(value, int) or value < 1:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"kg_extraction_config.{name} must be a positive integer for free extraction.")
     return {**common, **limits}
-
-
-def _kg_pipeline_extraction_options(config: dict[str, Any]) -> dict[str, Any]:
-    """Return ``SimpleKGPipeline`` options for the requested extraction mode."""
-    if config["mode"] == "constrained":
-        return {"entities": _CONSTRAINED_KG_ENTITIES, "relations": _CONSTRAINED_KG_RELATIONS}
-
-    entity_limit = config["max_entities_per_chunk"]
-    relation_limit = config["max_relationships_per_chunk"]
-    template = ERExtractionTemplate.DEFAULT_TEMPLATE.replace(
-        "Extract the entities (nodes) and specify their type from the following text.",
-        "Extract the entities (nodes) and specify their type from the following text. "
-        f"Extract at most {entity_limit} entities.",
-    ).replace(
-        "Also extract the relationships between these nodes.",
-        f"Also extract at most {relation_limit} relationships between these nodes.",
-    )
-    # "FREE" bypasses automatic schema extraction. Omitting the schema would
-    # ask the model to generate constraints, which can be invalid or conflicting.
-    # The model still determines entity and relationship types from each chunk.
-    return {"schema": "FREE", "prompt_template": ERExtractionTemplate(template=template)}
 
 
 class _EmbedderAdapter(_NeoEmbedder):  # type: ignore[misc]
@@ -515,7 +487,6 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]  # pylint: disable=to
         started_at = perf_counter()
         response = self._chat_with_retries(input, model_kwargs)
         with self._metrics_lock:
-            self._calls += 1
             self._elapsed_seconds += perf_counter() - started_at
         self._log_stop_reason(response)
         content = self._response_content(response, tool_mode=tool_mode)
@@ -531,10 +502,13 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]  # pylint: disable=to
         """Call the model, retrying rate limits and transient failures with backoff.
 
         Retries happen in the calling worker thread, so blocking sleep does not
-        stall the event loop that awaits :meth:`ainvoke`.
+        stall the event loop that awaits :meth:`ainvoke`. Every HTTP attempt is
+        counted so the metrics reconcile with the traffic the endpoint sees.
         """
         attempts = self._max_retries + 1
         for attempt in range(attempts):
+            with self._metrics_lock:
+                self._calls += 1
             try:
                 return self._model.chat(input, **model_kwargs)[0]
             except Exception as exc:  # pylint: disable=broad-except
@@ -609,7 +583,7 @@ class _LLMAdapter(_NeoLLMInterface):  # type: ignore[misc]  # pylint: disable=to
 
     @property
     def metrics(self) -> tuple[int, float, int]:
-        """Return model calls, cumulative duration, and repaired response count."""
+        """Return model request attempts, cumulative duration, and repaired response count."""
         with self._metrics_lock:
             return self._calls, self._elapsed_seconds, self._format_repairs
 
