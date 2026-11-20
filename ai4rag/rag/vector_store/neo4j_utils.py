@@ -77,8 +77,13 @@ DEFAULT_KG_LLM_SDK_MAX_RETRIES = 0
 # rejects everything, e.g. when the model subscription token quota is exhausted.
 DEFAULT_KG_RATE_LIMIT_BREAKER_THRESHOLD = 12
 KG_LLM_RETRY_MAX_BACKOFF_SECONDS = 60.0
-KG_MAX_ENTITIES_PER_CHUNK = 6
-KG_MAX_RELATIONSHIPS_PER_CHUNK = 6
+# Small caps keep a single extraction response well inside the completion
+# budget, so a dense chunk cannot spend it all on entities and truncate the JSON.
+KG_MAX_ENTITIES_PER_CHUNK = 5
+KG_MAX_RELATIONSHIPS_PER_CHUNK = 5
+# Descriptions are optional and only used when the selected schema requires
+# them; keep them to a short phrase so the JSON stays compact.
+KG_MAX_DESCRIPTION_WORDS = 8
 _RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429})
 # MaaS does not call tools on our behalf, so extraction cannot rely on
 # function calling. The contract is a required JSON Schema instead: every

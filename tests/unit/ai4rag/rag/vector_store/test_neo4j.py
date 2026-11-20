@@ -642,9 +642,11 @@ class TestAddDocuments:
         chunk = AI4RAGChunk(text=text, metadata={"document_id": "document.md"})
 
         prompt = store._build_kg_batch_prompt([chunk])
+        assert "at most 5 entities and at most 5 relationships" in prompt
         assert f"at most {KG_MAX_ENTITIES_PER_CHUNK} entities" in prompt
         assert f"{KG_MAX_RELATIONSHIPS_PER_CHUNK} relationships" in prompt
-        assert "generate a concise, factual description of no more than 12 words" in prompt
+        assert "Never exceed these limits" in prompt
+        assert "generate a concise, factual description of no more than 8 words" in prompt
         assert json.loads(prompt.rsplit("Input chunks:\n", maxsplit=1)[1]) == [
             {"chunk_id": chunk.chunk_id, "text": text}
         ]
@@ -662,7 +664,7 @@ class TestAddDocuments:
 
         prompt = store._build_kg_batch_prompt(self._make_chunks(1))
 
-        assert "at most 9 entities and 11 relationships" in prompt
+        assert "at most 9 entities and at most 11 relationships" in prompt
 
     def test_kg_pipeline_does_not_log_chunk_text(self, mock_driver_cls, mock_embedding, neo4j_config, caplog):
         store = Neo4jGraphStore(mock_embedding, neo4j_config, collection_name="ai4rag_col")

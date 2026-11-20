@@ -106,8 +106,12 @@ Each chunk is therefore one KG extraction input; an upstream chunk that is too l
 
 | Extraction mode | Behavior |
 | --- | --- |
-| `constrained` (default) | Uses ai4rag's fixed entity and relationship type sets. |
+| `constrained` (default) | Uses ai4rag's fixed entity and relationship type sets, and caps extraction at 5 entities and 5 relationships per chunk. |
 | `free` | Passes `schema="FREE"`, lets the model choose types, and uses positive per-chunk entity and relationship limits. |
+
+The prompt states both caps as hard limits and asks the model to keep entity names and any
+schema-required descriptions to a short phrase (`KG_MAX_DESCRIPTION_WORDS`, default 8), so a dense
+chunk cannot spend the completion budget on verbose output and truncate the JSON.
 
 Both modes accept `kg_extraction_config.max_completion_tokens`, a positive integer
 defaulting to `1024`. It caps each entity-extraction response independently of the

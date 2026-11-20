@@ -31,6 +31,7 @@ from ai4rag.rag.vector_store.config import Neo4jConfig
 from ai4rag.rag.vector_store.neo4j_utils import (
     KG_BATCH_JSON_SCHEMA_RESPONSE_FORMAT,
     KG_BATCH_RESPONSE_FORMAT,
+    KG_MAX_DESCRIPTION_WORDS,
     KG_MAX_ENTITIES_PER_CHUNK,
     KG_MAX_RELATIONSHIPS_PER_CHUNK,
     Neo4jGraphSchema,
@@ -669,11 +670,14 @@ class Neo4jGraphStore(BaseVectorStore):
             "Extract a knowledge graph independently for every input chunk. "
             "Never create relationships between different chunk_id values. "
             f"{schema}\n"
-            f"For each chunk, extract at most {max_entities} entities and "
-            f"{max_relationships} relationships. Node properties must contain only "
-            "the entity name. Relationship properties must be empty. When the selected "
+            f"Hard limits per chunk: at most {max_entities} entities and at most "
+            f"{max_relationships} relationships. Never exceed these limits; when the chunk contains more "
+            "candidates, keep only the most important entities and relationships and drop the rest. "
+            "Node properties must contain only the entity name, written as a short name of no more than "
+            f"{KG_MAX_DESCRIPTION_WORDS} words. Relationship properties must be empty. Only when the selected "
             "schema requires an entity or relationship description, generate a concise, factual description "
-            "of no more than 12 words.\n" + contract + f"Input chunks:\n{json.dumps(payload)}"
+            f"of no more than {KG_MAX_DESCRIPTION_WORDS} words; keep it to a short phrase and never paraphrase "
+            "the whole chunk.\n" + contract + f"Input chunks:\n{json.dumps(payload)}"
         )
 
     @staticmethod
